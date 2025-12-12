@@ -117,7 +117,7 @@ class DedupParameters:
   """If not None, will display some cluster samples."""
 
   work_dir: str = (
-    '/mnt/cluster_storage'  # Put this here because the previous version was breaking things.
+    '/raid/spark-team/leey/tmp'  # Put this here because the previous version was breaking things.
   )
   """Used by the datajuicer flavor to dump temporary data."""
 
@@ -949,7 +949,10 @@ def execute(parameters: DedupParameters) -> None:
       input_path.append(document_path)
 
   import gcsfs
-  filesystem = gcsfs.GCSFileSystem(project="test-vertex")
+  filesystem = gcsfs.GCSFileSystem(
+    project="rapids-spark",
+    token="/home/leey/.config/gcloud/application_default_credentials.json"
+  )
   ds = ray.data.read_parquet(  # type: ignore
     input_path,
     filesystem=filesystem,

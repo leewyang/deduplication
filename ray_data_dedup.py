@@ -281,7 +281,8 @@ def create_edges_from_collisions(batch: Dict[str, np.ndarray]) -> Dict[str, np.n
     a = np.asarray(batch['doc_id'])
     n = a.shape[0]
     if n < 2:
-        return {'src': np.array([]), 'dst': np.array([])}
+        # Preserve dtype to maintain schema consistency across batches
+        return {'src': np.array([], dtype=a.dtype), 'dst': np.array([], dtype=a.dtype)}
 
     # indices for all i < j
     min_doc_id = min(a)
@@ -564,7 +565,9 @@ def main():
         '--output',
         type=str,
         required=False,
-        default=os.path.join(os.environ["ANYSCALE_ARTIFACT_STORAGE"], "rliaw-scratch"),
+        default=os.path.join(
+            os.environ.get("ANYSCALE_ARTIFACT_STORAGE", "/raid/spark-team/leey/tmp"), "dedup-output"
+        ),
         help='Output path for deduplicated data',
     )
     parser.add_argument(
