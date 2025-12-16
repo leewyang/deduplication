@@ -13,6 +13,7 @@ Architecture:
 """
 
 import argparse
+import glob as glob_module
 import hashlib
 import logging
 import struct
@@ -33,6 +34,24 @@ MERSENNE_PRIME = np.uint64((1 << 61) - 1)
 MAX_HASH = np.uint32((1 << 32) - 1)
 
 
+def _is_gcs_path(path: str) -> bool:
+    """Check if a path is a GCS path."""
+    return path.startswith("gs://")
+
+
+def check_path_exists(path: str) -> bool:
+    """Check if a path exists (supports both GCS and local paths)."""
+    if _is_gcs_path(path):
+        return check_gcs_path_exists(path)
+    else:
+        return check_local_path_exists(path)
+
+
+def check_local_path_exists(path: str) -> bool:
+    """Check if a local path exists."""
+    return os.path.exists(path)
+
+
 def check_gcs_path_exists(path: str) -> bool:
     """Check if a GCS path exists."""
     gcs_fs = pafs.GcsFileSystem()
@@ -50,6 +69,53 @@ def check_gcs_path_exists(path: str) -> bool:
     selector = pafs.FileSelector(path, recursive=True)
     file_infos = gcs_fs.get_file_info(selector)
     return len(file_infos) > 0
+
+
+def list_parquet_files(path: str) -> List[str]:
+    """
+    List all parquet files in a directory recursively (supports both GCS and local paths).
+
+    Args:
+        path: Path to directory (GCS path like gs://bucket/path/ or local path)
+
+    Returns:
+        List of full paths to parquet files
+    """
+    if _is_gcs_path(path):
+        return list_gcs_parquet_files(path)
+    else:
+        return list_local_parquet_files(path)
+
+
+def list_local_parquet_files(path: str) -> List[str]:
+    """
+    List all parquet files in a local directory recursively.
+
+    Args:
+        path: Local path to directory
+
+    Returns:
+        List of full local paths to parquet files
+    """
+    path = path.rstrip("/")
+    logger.info(f"Listing parquet files in {path}")
+
+    parquet_files = []
+
+    if os.path.isfile(path):
+        # Single file
+        if path.endswith('.parquet'):
+            parquet_files.append(path)
+    elif os.path.isdir(path):
+        # Directory - search recursively
+        pattern = os.path.join(path, "**", "*.parquet")
+        parquet_files = glob_module.glob(pattern, recursive=True)
+    else:
+        # Could be a glob pattern
+        parquet_files = [f for f in glob_module.glob(path, recursive=True) if f.endswith('.parquet')]
+
+    logger.info(f"Found {len(parquet_files)} parquet files")
+    return parquet_files
 
 
 def list_gcs_parquet_files(path: str) -> List[str]:
@@ -437,7 +503,7 @@ def get_or_create_minhash_bands(
         output_blocks: int = 100) -> ray.data.Dataset:
 
     if minhash_checkpoint_uri is not None:
-        if not check_gcs_path_exists(minhash_checkpoint_uri):
+        if not check_path_exists(minhash_checkpoint_uri):
             raise ValueError(f"Checkpoint URI {minhash_checkpoint_uri} does not exist")
         bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
         bands_ds = bands_ds.repartition(num_blocks=output_blocks)
@@ -651,8 +717,8 @@ def main():
     logger.info(f"Reading data from {args.input}")
     input_path = args.input
 
-    # List all parquet files in the directory
-    list_of_all_input_files = list_gcs_parquet_files(input_path)
+    # List all parquet files in the directory (supports both GCS and local paths)
+    list_of_all_input_files = list_parquet_files(input_path)
     logger.info(f"Reading {len(list_of_all_input_files)} parquet files")
 
     ds = ray.data.read_parquet(list_of_all_input_files)

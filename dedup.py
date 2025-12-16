@@ -3,6 +3,7 @@
 # uv run ray_minhash_lsh_datajuicer.py --flavor=datajuicer --documents_path=gs://anyscale-example-datasets/HuggingFaceFW/fineweb-edu/data/ --text_column=text --threshold=0.7 --ngram_size=5 --output=/mnt/cluster_storage/
 
 import argparse
+import glob as glob_module
 import hashlib
 import logging
 import os
@@ -915,31 +916,52 @@ def _bucket_and_blob_path_from_uri(
   return (bucket, blob_path)
 
 
+def _is_gcs_path(path: str) -> bool:
+  """Check if a path is a GCS path."""
+  return path.startswith('gs://')
+
+
+def _expand_local_glob(pattern: str) -> list[str]:
+  """Expand a local glob pattern to a list of file paths."""
+  return glob_module.glob(pattern, recursive=True)
+
+
 def execute(parameters: DedupParameters) -> None:
   start_time = time.time()
+
+  # Determine if we're dealing with GCS or local paths
+  is_gcs = any(_is_gcs_path(p) for p in parameters.documents_path.split(','))
 
   # Process documents
   input_path: list[str] = []
   for document_path in parameters.documents_path.split(','):
     if document_path.find('*') != -1:
       logging.info(f'Input {document_path} has a star, will do a glob search')
-      # Glob pattern.
-      index_of_first_star = document_path.index('*')
-      index_of_previous_slash = document_path.rfind('/', 0, index_of_first_star)
-      if index_of_previous_slash == -1:
-        raise ValueError('TODO')
+      if _is_gcs_path(document_path):
+        # GCS glob pattern.
+        index_of_first_star = document_path.index('*')
+        index_of_previous_slash = document_path.rfind('/', 0, index_of_first_star)
+        if index_of_previous_slash == -1:
+          raise ValueError('TODO')
 
-      main = document_path[0 : index_of_previous_slash + 1]
-      glob = '**/' + document_path[index_of_previous_slash + 1 :]
+        main = document_path[0 : index_of_previous_slash + 1]
+        glob = '**/' + document_path[index_of_previous_slash + 1 :]
 
-      bucket, blob_path = _bucket_and_blob_path_from_uri(main)
-      # root_blob = bucket.blob(blob_name=blob_path)
+        bucket, blob_path = _bucket_and_blob_path_from_uri(main, project="rapids-spark")
+        # root_blob = bucket.blob(blob_name=blob_path)
 
-      for subblob in bucket.list_blobs(prefix=blob_path, match_glob=glob):  # type: ignore
-        input_path.append(f'gs://{bucket.name}/{subblob.name}')  # type: ignore
-      logging.info(
-        f'Found {len(input_path)} document(s) matching {document_path}'
-      )
+        for subblob in bucket.list_blobs(prefix=blob_path, match_glob=glob):  # type: ignore
+          input_path.append(f'gs://{bucket.name}/{subblob.name}')  # type: ignore
+        logging.info(
+          f'Found {len(input_path)} document(s) matching {document_path}'
+        )
+      else:
+        # Local filesystem glob pattern.
+        matched_files = _expand_local_glob(document_path)
+        input_path.extend(matched_files)
+        logging.info(
+          f'Found {len(matched_files)} document(s) matching {document_path}'
+        )
     else:
       logging.info(
         f'Input {document_path} is a file or a directory, will pass it directly to read_parquet(...)'
@@ -948,16 +970,23 @@ def execute(parameters: DedupParameters) -> None:
       # TODO in the future.
       input_path.append(document_path)
 
-  import gcsfs
-  filesystem = gcsfs.GCSFileSystem(
-    project="rapids-spark",
-    token="/home/leey/.config/gcloud/application_default_credentials.json"
-  )
-  ds = ray.data.read_parquet(  # type: ignore
-    input_path,
-    filesystem=filesystem,
-    ray_remote_args={"memory": 1e10}
-  )
+  if is_gcs:
+    import gcsfs
+    filesystem = gcsfs.GCSFileSystem(
+      project="rapids-spark",
+      token="/home/leey/.config/gcloud/application_default_credentials.json"
+    )
+    ds = ray.data.read_parquet(  # type: ignore
+      input_path,
+      filesystem=filesystem,
+      ray_remote_args={"memory": 1e10}
+    )
+  else:
+    # Local filesystem - no special filesystem needed
+    ds = ray.data.read_parquet(  # type: ignore
+      input_path,
+      ray_remote_args={"memory": 1e10}
+    )
 
   # Filter data so we only have what matters to us: id and text.
   ds_less_columns = ds.select_columns(  # type: ignore
