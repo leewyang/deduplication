@@ -512,7 +512,15 @@ def find_duplicate_components(
     edges_ds = bands_ds.groupby(
         ['band_id', 'band_hash'], num_partitions=hash_parallelism).map_groups(create_edges_from_collisions, batch_format="numpy")
     edges_ds = edges_ds.materialize()
-    print("Length of edges_ds", edges_ds.count())
+    edges_count = edges_ds.count()
+    print("Length of edges_ds", edges_count)
+
+    # Handle empty edges case (no collisions found)
+    if edges_count == 0:
+        logger.info("No candidate pairs found. No duplicates detected.")
+        # Return empty dataset with expected schema
+        empty_df = pd.DataFrame({"node": pd.Series(dtype=object), "parent": pd.Series(dtype=object)})
+        return ray.data.from_pandas(empty_df)
 
     # Deduplicate edges (same pair might appear in multiple bands)
     logger.info("Step 4: Deduplicating edges...")
@@ -678,14 +686,20 @@ def main():
         hash_parallelism=args.parallelism
     )
     duplicate_components = duplicate_components.materialize()
+    duplicate_count = duplicate_components.count()
 
     # Join with original dataset to get full document content
-    deduplicated_ds = ds.join(
-        duplicate_components,
-        on=(args.id_column,),
-        right_on=('node',),
-        join_type='left_anti',
-        num_partitions=args.parallelism)
+    if duplicate_count == 0:
+        # No duplicates found, skip the join
+        logger.info("No duplicates found, skipping join.")
+        deduplicated_ds = ds
+    else:
+        deduplicated_ds = ds.join(
+            duplicate_components,
+            on=(args.id_column,),
+            right_on=('node',),
+            join_type='left_anti',
+            num_partitions=args.parallelism)
 
     deduplicated_ds = deduplicated_ds.materialize()
 
