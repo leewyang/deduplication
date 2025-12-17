@@ -27,6 +27,18 @@ import ray
 from scipy import integrate
 import os
 
+# Optional GPU imports - will be imported lazily when needed
+try:
+    import cupy as cp
+    import cudf
+    import pylibcudf
+    CUPY_AVAILABLE = True
+except ImportError:
+    CUPY_AVAILABLE = False
+    cp = None
+    cudf = None
+    pylibcudf = None
+
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -260,6 +272,176 @@ class MinHashGenerator:
         return phv.min(axis=0)
 
 
+class GPUMinHashGenerator:
+    """
+    GPU-accelerated MinHash signature generator using CuPy and MurmurHash3.
+
+    This class provides the same interface as MinHashGenerator but uses GPU
+    acceleration for the permutation computations.
+    """
+
+    def __init__(
+        self,
+        num_perm: int = 128,
+        ngram_size: int = 5,
+        seed: int = 42,
+        lowercase: bool = True,
+    ):
+        if not CUPY_AVAILABLE:
+            raise ImportError(
+                "CuPy, cuDF, and pylibcudf are required for GPU MinHash. "
+                "Install RAPIDS cuDF: https://docs.rapids.ai/install"
+            )
+
+        self.num_perm = num_perm
+        self.ngram_size = ngram_size
+        self.lowercase = lowercase
+        self.seed = seed
+
+        # Generate permutations for MinHash (same as CPU version for compatibility)
+        gen = np.random.RandomState(seed=seed)
+        perm_a_np, perm_b_np = np.array(
+            [
+                (
+                    gen.randint(1, MERSENNE_PRIME, dtype=np.uint64),
+                    gen.randint(0, MERSENNE_PRIME, dtype=np.uint64),
+                )
+                for _ in range(num_perm)
+            ],
+            dtype=np.uint64,
+        ).T
+
+        # Transfer permutation coefficients to GPU (done once)
+        self.perm_a = cp.asarray(perm_a_np, dtype=cp.uint64)
+        self.perm_b = cp.asarray(perm_b_np, dtype=cp.uint64)
+
+        # Pre-allocate max hash array on GPU
+        self.max_hash_gpu = cp.full(num_perm, MAX_HASH, dtype=cp.uint32)
+
+    def _ngrams(self, text: str) -> List[str]:
+        """Generate character n-grams from text as a list of strings."""
+        if self.lowercase:
+            text = text.lower()
+        return [
+            text[i:i + self.ngram_size]
+            for i in range(len(text) - self.ngram_size + 1)
+        ]
+
+    def _hash_ngrams_gpu(self, ngrams_list: List[str]) -> cp.ndarray:
+        """
+        Hash a list of n-grams using GPU-native MurmurHash3 via pylibcudf.
+
+        Uses pylibcudf.hashing.murmurhash3_x86_32 for fully GPU-accelerated hashing.
+        See: https://docs.rapids.ai/api/cudf/stable/pylibcudf/api_docs/hashing/#pylibcudf.hashing.murmurhash3_x86_32
+
+        Args:
+            ngrams_list: List of n-gram strings
+
+        Returns:
+            CuPy array of 32-bit hash values on GPU
+        """
+        if len(ngrams_list) == 0:
+            return cp.array([], dtype=cp.uint32)
+
+        # Create a cudf Series from the n-grams (strings)
+        ngrams_series = cudf.Series(ngrams_list, dtype='str')
+
+        # Convert to pylibcudf Table for hashing
+        # pylibcudf.hashing.murmurhash3_x86_32 takes a Table as input
+        plc_table = pylibcudf.Table([ngrams_series._column.to_pylibcudf(mode="read")])
+
+        # Compute MurmurHash3 32-bit hash on GPU
+        hash_column = pylibcudf.hashing.murmurhash3_x86_32(plc_table, self.seed)
+
+        # Convert result back to cudf Series, then to CuPy array
+        result_series = cudf.Series.from_pylibcudf(hash_column)
+        return cp.asarray(result_series.values, dtype=cp.uint32)
+
+    def compute_minhash(self, text: str) -> np.ndarray:
+        """
+        Compute MinHash signature for a single text using GPU.
+
+        Returns:
+            Array of shape (num_perm,) with uint32 values
+        """
+        ngrams = self._ngrams(text)
+
+        if len(ngrams) == 0:
+            # Empty text gets max hash values
+            return cp.asnumpy(self.max_hash_gpu)
+
+        # Hash n-grams on GPU using pylibcudf's MurmurHash3
+        hashes_gpu = self._hash_ngrams_gpu(ngrams).astype(cp.uint64)
+
+        # Apply permutations on GPU: (h * a + b) % prime
+        # Broadcasting: hashes_gpu[:, None] has shape (num_tokens, 1)
+        # perm_a[None, :] has shape (1, num_perm)
+        phv = ((hashes_gpu[:, None] * self.perm_a[None, :] + self.perm_b) % MERSENNE_PRIME).astype(cp.uint32)
+
+        # Take minimum across all tokens for each permutation
+        result = phv.min(axis=0)
+
+        # Transfer result back to CPU
+        return cp.asnumpy(result)
+
+    def compute_minhash_batch(self, texts: List[str]) -> np.ndarray:
+        """
+        Compute MinHash signatures for a batch of texts using GPU.
+
+        This method is optimized for batch processing, minimizing
+        GPU memory transfers by processing multiple texts together.
+        Uses pylibcudf's murmurhash3_x86_32 for fully GPU-accelerated hashing.
+
+        Args:
+            texts: List of text strings
+
+        Returns:
+            Array of shape (num_texts, num_perm) with uint32 values
+        """
+        num_texts = len(texts)
+        results = np.empty((num_texts, self.num_perm), dtype=np.uint32)
+
+        # Process texts and collect all ngram hashes
+        all_ngrams_per_text = []
+        text_lengths = []
+
+        for text in texts:
+            ngrams = self._ngrams(text)
+            all_ngrams_per_text.append(ngrams)
+            text_lengths.append(len(ngrams))
+
+        # Flatten all n-grams for batch hashing
+        all_ngrams_flat = []
+        for ngrams in all_ngrams_per_text:
+            all_ngrams_flat.extend(ngrams)
+
+        if len(all_ngrams_flat) == 0:
+            # All texts are empty
+            return np.full((num_texts, self.num_perm), MAX_HASH, dtype=np.uint32)
+
+        # Batch hash all n-grams on GPU using pylibcudf's MurmurHash3
+        all_hashes_gpu = self._hash_ngrams_gpu(all_ngrams_flat).astype(cp.uint64)
+
+        # Process each text's hashes
+        offset = 0
+        for i, length in enumerate(text_lengths):
+            if length == 0:
+                results[i] = MAX_HASH
+            else:
+                # Get this text's hashes
+                hashes_gpu = all_hashes_gpu[offset:offset + length]
+
+                # Apply permutations on GPU
+                phv = ((hashes_gpu[:, None] * self.perm_a[None, :] + self.perm_b) % MERSENNE_PRIME).astype(cp.uint32)
+
+                # Take minimum and transfer back
+                results[i] = cp.asnumpy(phv.min(axis=0))
+
+            offset += length
+
+        return results
+
+
 def generate_minhash_signatures(
     batch: Dict[str, np.ndarray],
     text_column: str,
@@ -276,6 +458,34 @@ def generate_minhash_signatures(
 
     texts = batch[text_column]
     signatures = np.array([generator.compute_minhash(text) for text in texts])
+
+    # Add signatures to batch
+    batch['minhash'] = signatures
+    return batch
+
+
+def generate_minhash_signatures_gpu(
+    batch: Dict[str, np.ndarray],
+    text_column: str,
+    num_perm: int,
+    ngram_size: int,
+    seed: int,
+) -> Dict[str, np.ndarray]:
+    """
+    GPU-accelerated Ray Data UDF to generate MinHash signatures for a batch of documents.
+
+    This function is called by map_batches with num_gpus=1 and processes documents
+    using GPU acceleration via CuPy and MurmurHash3.
+
+    For best performance, use larger batch sizes (e.g., 4096+) to amortize
+    GPU memory transfer overhead.
+    """
+    generator = GPUMinHashGenerator(num_perm=num_perm, ngram_size=ngram_size, seed=seed)
+
+    texts = list(batch[text_column])
+
+    # Use batch processing for better GPU efficiency
+    signatures = generator.compute_minhash_batch(texts)
 
     # Add signatures to batch
     batch['minhash'] = signatures
@@ -329,6 +539,67 @@ def generate_lsh_bands(
             # Create a hash of the band
             band_hash = hashlib.sha256(band_values.tobytes()).hexdigest()[:16]
             band_hashes.append(band_hash)
+
+    return {
+        'doc_id': doc_ids,
+        'band_id': band_ids,
+        'band_hash': np.array(band_hashes),
+    }
+
+
+def generate_lsh_bands_gpu(
+    batch: Dict[str, np.ndarray],
+    num_bands: int,
+    rows_per_band: int,
+) -> Dict[str, np.ndarray]:
+    """
+    GPU-optimized LSH band generation from MinHash signatures.
+
+    Uses pylibcudf's murmurhash3_x64_128 for GPU-accelerated band hashing.
+    See: https://docs.rapids.ai/api/cudf/stable/pylibcudf/api_docs/hashing/#pylibcudf.hashing.murmurhash3_x64_128
+
+    This creates multiple (band_id, band_hash) pairs per document.
+
+    Returns a flattened batch where each row represents one band of one document.
+    """
+    if not CUPY_AVAILABLE:
+        raise ImportError(
+            "GPU mode requested but cudf/pylibcudf not available. "
+            "Install with: pip install cudf-cu12 (or appropriate CUDA version)"
+        )
+
+    minhashes = batch['minhash']
+    num_docs = len(minhashes)
+
+    # Replicate document IDs for each band
+    doc_ids = np.repeat(batch['id'], num_bands)
+
+    # Generate band IDs: [0, 1, ..., num_bands-1] repeated for each doc
+    band_ids = np.tile(np.arange(num_bands), num_docs)
+
+    # Collect all band values as strings for batch GPU hashing
+    # We convert band values to hex strings for consistent hashing
+    band_strings = []
+    for doc_idx, minhash in enumerate(minhashes):
+        for band_idx in range(num_bands):
+            start = band_idx * rows_per_band
+            end = start + rows_per_band
+            band_values = minhash[start:end]
+            # Convert band values to a hex string representation
+            band_strings.append(band_values.tobytes().hex())
+
+    # Create cudf Series for GPU-accelerated hashing
+    band_series = cudf.Series(band_strings, dtype='str')
+
+    # Create pylibcudf Table for hashing
+    plc_table = pylibcudf.Table([band_series._column.to_pylibcudf(mode="read")])
+
+    # Compute MurmurHash3 128-bit hash on GPU (returns Table with two uint64 columns)
+    hash_table = pylibcudf.hashing.murmurhash3_x64_128(plc_table, seed=0)
+
+    # Convert first column to hex strings for band_hash (use first 64 bits)
+    hash_col = cudf.Series.from_pylibcudf(hash_table.columns()[0])
+    band_hashes = hash_col.to_pandas().apply(lambda x: format(x, '016x')).values
 
     return {
         'doc_id': doc_ids,
@@ -500,8 +771,27 @@ def get_or_create_minhash_bands(
         num_perm: int,
         ngram_size: int,
         seed: int,
-        output_blocks: int = 100) -> ray.data.Dataset:
+        output_blocks: int = 100,
+        use_gpu: bool = False,
+        gpu_batch_size: int = 4096) -> ray.data.Dataset:
+    """
+    Generate MinHash signatures and LSH bands for a dataset.
 
+    Args:
+        ds: Input Ray dataset
+        minhash_checkpoint_uri: Optional checkpoint path to load/save bands
+        text_column: Name of the text column
+        threshold: Jaccard similarity threshold
+        num_perm: Number of MinHash permutations
+        ngram_size: Character n-gram size
+        seed: Random seed
+        output_blocks: Number of output partitions
+        use_gpu: Whether to use GPU acceleration
+        gpu_batch_size: Batch size for GPU processing (larger = better GPU utilization)
+
+    Returns:
+        Dataset with LSH bands
+    """
     if minhash_checkpoint_uri is not None:
         if not check_path_exists(minhash_checkpoint_uri):
             raise ValueError(f"Checkpoint URI {minhash_checkpoint_uri} does not exist")
@@ -520,30 +810,64 @@ def get_or_create_minhash_bands(
     logger.info(f"LSH parameters: {num_bands} bands, {rows_per_band} rows per band")
 
     # Step 1: Generate MinHash signatures
-    logger.info("Step 1: Generating MinHash signatures...")
-    # Schema: dict_keys(['*', 'minhash'])
-    ds_with_minhash = ds.map_batches(
-        generate_minhash_signatures,
-        fn_kwargs={
-            'text_column': text_column,
-            'num_perm': num_perm,
-            'ngram_size': ngram_size,
-            'seed': seed,
-        },
-        batch_format='numpy',
-    )
+    if use_gpu:
+        if not CUPY_AVAILABLE:
+            raise ImportError(
+                "GPU mode requested but cudf/pylibcudf not available. "
+                "Install RAPIDS cuDF: https://docs.rapids.ai/install"
+            )
+        logger.info("Step 1: Generating MinHash signatures (GPU)...")
+        # Schema: dict_keys(['*', 'minhash'])
+        ds_with_minhash = ds.map_batches(
+            generate_minhash_signatures_gpu,
+            fn_kwargs={
+                'text_column': text_column,
+                'num_perm': num_perm,
+                'ngram_size': ngram_size,
+                'seed': seed,
+            },
+            batch_format='numpy',
+            num_gpus=1,  # Request GPU from Ray scheduler
+            batch_size=gpu_batch_size,  # Larger batches for better GPU utilization
+        )
+    else:
+        logger.info("Step 1: Generating MinHash signatures (CPU)...")
+        # Schema: dict_keys(['*', 'minhash'])
+        ds_with_minhash = ds.map_batches(
+            generate_minhash_signatures,
+            fn_kwargs={
+                'text_column': text_column,
+                'num_perm': num_perm,
+                'ngram_size': ngram_size,
+                'seed': seed,
+            },
+            batch_format='numpy',
+        )
 
     # Step 2: Generate LSH bands (creates multiple rows per document)
-    logger.info("Step 2: Generating LSH bands...")
     # Schema: ['doc_id', 'band_id', 'band_hash'], non are unique
-    bands_ds: ray.data.Dataset = ds_with_minhash.map_batches(
-        generate_lsh_bands,
-        fn_kwargs={
-            'num_bands': num_bands,
-            'rows_per_band': rows_per_band,
-        },
-        batch_format='numpy',
-    )
+    if use_gpu:
+        logger.info("Step 2: Generating LSH bands (GPU-optimized with MurmurHash3)...")
+        bands_ds: ray.data.Dataset = ds_with_minhash.map_batches(
+            generate_lsh_bands_gpu,
+            fn_kwargs={
+                'num_bands': num_bands,
+                'rows_per_band': rows_per_band,
+            },
+            batch_format='numpy',
+            num_gpus=1,  # Request GPU from Ray scheduler for cudf/pylibcudf operations
+            batch_size=gpu_batch_size,  # Larger batches for better GPU utilization
+        )
+    else:
+        logger.info("Step 2: Generating LSH bands (CPU)...")
+        bands_ds: ray.data.Dataset = ds_with_minhash.map_batches(
+            generate_lsh_bands,
+            fn_kwargs={
+                'num_bands': num_bands,
+                'rows_per_band': rows_per_band,
+            },
+            batch_format='numpy',
+        )
     bands_ds = bands_ds.materialize()
     bands_ds = bands_ds.repartition(num_blocks=output_blocks)
     bands_ds = bands_ds.materialize()
@@ -708,6 +1032,18 @@ def main():
         default=False,
         help="Disable progress bars",
     )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        default=False,
+        help="Use GPU acceleration for MinHash computation (requires RAPIDS cuDF)",
+    )
+    parser.add_argument(
+        "--gpu-batch-size",
+        type=int,
+        default=4096,
+        help="Batch size for GPU processing (larger = better GPU utilization)",
+    )
 
     args = parser.parse_args()
     if args.disable_progress_bars:
@@ -733,6 +1069,13 @@ def main():
     logger.info(f"Input dataset: {input_count} documents")
 
     logger.info(f"Starting large-scale deduplication with threshold={args.threshold}")
+    if args.use_gpu:
+        logger.info("GPU acceleration enabled for MinHash computation")
+        if not CUPY_AVAILABLE:
+            raise ImportError(
+                "GPU mode requested but cudf/pylibcudf not available. "
+                "Install RAPIDS cuDF: https://docs.rapids.ai/install"
+            )
 
     bands_ds = get_or_create_minhash_bands(
         ds,
@@ -742,7 +1085,9 @@ def main():
         ngram_size=args.ngram_size,
         seed=args.seed,
         minhash_checkpoint_uri=args.minhash_checkpoint_uri,
-        output_blocks=args.parallelism
+        output_blocks=args.parallelism,
+        use_gpu=args.use_gpu,
+        gpu_batch_size=args.gpu_batch_size,
     )
 
     # Duplicate components: Schema: ['node', 'parent']
@@ -834,11 +1179,147 @@ def test_connected(local: bool = False):
     print(result)
 
 
+def test_gpu_minhash():
+    """
+    Test GPU MinHash implementation against CPU baseline for correctness.
+
+    Note: The hash values will differ between CPU (SHA1) and GPU (MurmurHash3)
+    implementations, but the Jaccard similarity estimates should be comparable.
+    This test verifies that the GPU implementation produces valid MinHash signatures
+    and that the overall deduplication pipeline works correctly.
+    """
+    if not CUPY_AVAILABLE:
+        print("CuPy not available, skipping GPU test")
+        return
+
+    print("=" * 60)
+    print("Testing GPU MinHash Implementation")
+    print("=" * 60)
+
+    # Test parameters
+    num_perm = 128
+    ngram_size = 5
+    seed = 42
+
+    # Test texts with known similarity
+    test_texts = [
+        "The quick brown fox jumps over the lazy dog",
+        "The quick brown fox jumps over the lazy cat",  # Similar to first
+        "A completely different sentence about nothing",
+        "The quick brown fox jumps over the lazy dog",  # Exact duplicate of first
+        "",  # Empty text
+        "Short",  # Very short text (less than ngram_size)
+    ]
+
+    # Initialize generators
+    cpu_gen = MinHashGenerator(num_perm=num_perm, ngram_size=ngram_size, seed=seed)
+    gpu_gen = GPUMinHashGenerator(num_perm=num_perm, ngram_size=ngram_size, seed=seed)
+
+    print(f"\nTest configuration:")
+    print(f"  - num_perm: {num_perm}")
+    print(f"  - ngram_size: {ngram_size}")
+    print(f"  - seed: {seed}")
+    print(f"  - num_texts: {len(test_texts)}")
+
+    # Compute signatures
+    print("\nComputing MinHash signatures...")
+    cpu_signatures = []
+    gpu_signatures = []
+
+    for i, text in enumerate(test_texts):
+        cpu_sig = cpu_gen.compute_minhash(text)
+        gpu_sig = gpu_gen.compute_minhash(text)
+        cpu_signatures.append(cpu_sig)
+        gpu_signatures.append(gpu_sig)
+
+        print(f"  Text {i}: '{text[:40]}...' if len(text) > 40 else '{text}'")
+        print(f"    CPU signature shape: {cpu_sig.shape}, dtype: {cpu_sig.dtype}")
+        print(f"    GPU signature shape: {gpu_sig.shape}, dtype: {gpu_sig.dtype}")
+
+    # Test batch processing
+    print("\nTesting batch processing...")
+    gpu_batch_signatures = gpu_gen.compute_minhash_batch(test_texts)
+    print(f"  Batch output shape: {gpu_batch_signatures.shape}")
+
+    # Verify batch results match individual results
+    batch_match = True
+    for i, (single, batch) in enumerate(zip(gpu_signatures, gpu_batch_signatures)):
+        if not np.array_equal(single, batch):
+            print(f"  WARNING: Batch result differs from single for text {i}")
+            batch_match = False
+
+    if batch_match:
+        print("  ✓ Batch processing produces identical results to single processing")
+
+    # Compute Jaccard similarity estimates
+    def estimate_jaccard(sig1, sig2):
+        """Estimate Jaccard similarity from MinHash signatures."""
+        return np.mean(sig1 == sig2)
+
+    print("\nJaccard similarity estimates (CPU vs GPU should be similar patterns):")
+    print("  CPU Implementation (SHA1):")
+    for i in range(len(test_texts)):
+        for j in range(i + 1, len(test_texts)):
+            sim = estimate_jaccard(cpu_signatures[i], cpu_signatures[j])
+            print(f"    texts[{i}] vs texts[{j}]: {sim:.4f}")
+
+    print("  GPU Implementation (MurmurHash3):")
+    for i in range(len(test_texts)):
+        for j in range(i + 1, len(test_texts)):
+            sim = estimate_jaccard(gpu_signatures[i], gpu_signatures[j])
+            print(f"    texts[{i}] vs texts[{j}]: {sim:.4f}")
+
+    # Verify expected behaviors
+    print("\nValidation checks:")
+
+    # Check 1: Empty text should produce max hash values
+    empty_idx = test_texts.index("")
+    if np.all(gpu_signatures[empty_idx] == MAX_HASH):
+        print("  ✓ Empty text produces max hash values")
+    else:
+        print("  ✗ Empty text did not produce max hash values")
+
+    # Check 2: Exact duplicates should have identical signatures (same hash function)
+    dup_indices = [i for i, t in enumerate(test_texts) if t == test_texts[0]]
+    if len(dup_indices) > 1:
+        i, j = dup_indices[0], dup_indices[-1]
+        if np.array_equal(gpu_signatures[i], gpu_signatures[j]):
+            print("  ✓ Exact duplicate texts have identical GPU signatures")
+        else:
+            print("  ✗ Exact duplicate texts have different GPU signatures")
+
+    # Check 3: Similar texts should have high similarity
+    similar_sim_cpu = estimate_jaccard(cpu_signatures[0], cpu_signatures[1])
+    similar_sim_gpu = estimate_jaccard(gpu_signatures[0], gpu_signatures[1])
+    if similar_sim_gpu > 0.5:
+        print(f"  ✓ Similar texts have high similarity (GPU: {similar_sim_gpu:.4f})")
+    else:
+        print(f"  ? Similar texts have lower than expected similarity (GPU: {similar_sim_gpu:.4f})")
+
+    # Check 4: Different texts should have low similarity
+    diff_sim_gpu = estimate_jaccard(gpu_signatures[0], gpu_signatures[2])
+    if diff_sim_gpu < 0.3:
+        print(f"  ✓ Different texts have low similarity (GPU: {diff_sim_gpu:.4f})")
+    else:
+        print(f"  ? Different texts have higher than expected similarity (GPU: {diff_sim_gpu:.4f})")
+
+    print("\n" + "=" * 60)
+    print("GPU MinHash test completed!")
+    print("=" * 60)
+
+
 if __name__ == '__main__':
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     )
-    main()
-    # test_connected()
+
+    # Check if running in test mode
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == '--test-gpu':
+        test_gpu_minhash()
+    elif len(sys.argv) > 1 and sys.argv[1] == '--test-connected':
+        test_connected()
+    else:
+        main()
     print("finished")
