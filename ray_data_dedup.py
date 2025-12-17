@@ -388,9 +388,10 @@ class GPUMinHashGenerator:
         """
         Compute MinHash signatures for a batch of texts using GPU.
 
-        This method is optimized for batch processing, minimizing
-        GPU memory transfers by processing multiple texts together.
-        Uses pylibcudf's murmurhash3_x86_32 for fully GPU-accelerated hashing.
+        This method is fully optimized for batch processing:
+        - All permutations are applied in a single GPU kernel
+        - Segmented min is computed using cuDF's optimized groupby
+        - Only one CPU-GPU transfer at the end
 
         Args:
             texts: List of text strings
@@ -399,21 +400,16 @@ class GPUMinHashGenerator:
             Array of shape (num_texts, num_perm) with uint32 values
         """
         num_texts = len(texts)
-        results = np.empty((num_texts, self.num_perm), dtype=np.uint32)
 
-        # Process texts and collect all ngram hashes
-        all_ngrams_per_text = []
-        text_lengths = []
-
-        for text in texts:
-            ngrams = self._ngrams(text)
-            all_ngrams_per_text.append(ngrams)
-            text_lengths.append(len(ngrams))
-
-        # Flatten all n-grams for batch hashing
+        # Process texts and collect all ngrams with text indices
         all_ngrams_flat = []
-        for ngrams in all_ngrams_per_text:
-            all_ngrams_flat.extend(ngrams)
+        text_indices = []
+
+        for i, text in enumerate(texts):
+            ngrams = self._ngrams(text)
+            if len(ngrams) > 0:
+                all_ngrams_flat.extend(ngrams)
+                text_indices.extend([i] * len(ngrams))
 
         if len(all_ngrams_flat) == 0:
             # All texts are empty
@@ -422,22 +418,36 @@ class GPUMinHashGenerator:
         # Batch hash all n-grams on GPU using pylibcudf's MurmurHash3
         all_hashes_gpu = self._hash_ngrams_gpu(all_ngrams_flat).astype(cp.uint64)
 
-        # Process each text's hashes
-        offset = 0
-        for i, length in enumerate(text_lengths):
-            if length == 0:
-                results[i] = MAX_HASH
-            else:
-                # Get this text's hashes
-                hashes_gpu = all_hashes_gpu[offset:offset + length]
+        # Apply permutations to ALL hashes at once (single GPU kernel)
+        # all_hashes_gpu[:, None] has shape (total_ngrams, 1)
+        # perm_a[None, :] has shape (1, num_perm)
+        # Result shape: (total_ngrams, num_perm)
+        all_phv = ((all_hashes_gpu[:, None] * self.perm_a[None, :] + self.perm_b) % MERSENNE_PRIME).astype(cp.uint32)
 
-                # Apply permutations on GPU
-                phv = ((hashes_gpu[:, None] * self.perm_a[None, :] + self.perm_b) % MERSENNE_PRIME).astype(cp.uint32)
+        # Use cuDF for efficient GPU-accelerated segmented min
+        # Build DataFrame with text_idx and permutation values
+        text_indices_gpu = cp.asarray(text_indices, dtype=cp.int32)
 
-                # Take minimum and transfer back
-                results[i] = cp.asnumpy(phv.min(axis=0))
+        # Create cuDF DataFrame with all data on GPU
+        data = {'text_idx': cudf.Series(text_indices_gpu)}
+        for p in range(self.num_perm):
+            data[f'p{p}'] = cudf.Series(all_phv[:, p])
 
-            offset += length
+        df = cudf.DataFrame(data)
+
+        # Group by text_idx and get min of each permutation column (fully on GPU)
+        perm_cols = [f'p{p}' for p in range(self.num_perm)]
+        grouped = df.groupby('text_idx', sort=True)[perm_cols].min()
+
+        # Initialize results with MAX_HASH for texts with no ngrams
+        results = np.full((num_texts, self.num_perm), MAX_HASH, dtype=np.uint32)
+
+        # Get results back to CPU (single transfer)
+        grouped_values = grouped.values.get()  # cupy to numpy
+        valid_indices = grouped.index.values.get()  # Get the text indices that had ngrams
+
+        # Fill in results for texts that had ngrams
+        results[valid_indices] = grouped_values
 
         return results
 
@@ -773,7 +783,8 @@ def get_or_create_minhash_bands(
         seed: int,
         output_blocks: int = 100,
         use_gpu: bool = False,
-        gpu_batch_size: int = 4096) -> ray.data.Dataset:
+        gpu_batch_size: int = 4096,
+        gpu_concurrency: Optional[int] = None) -> ray.data.Dataset:
     """
     Generate MinHash signatures and LSH bands for a dataset.
 
@@ -788,6 +799,7 @@ def get_or_create_minhash_bands(
         output_blocks: Number of output partitions
         use_gpu: Whether to use GPU acceleration
         gpu_batch_size: Batch size for GPU processing (larger = better GPU utilization)
+        gpu_concurrency: Number of concurrent GPU tasks (None = auto, based on available GPUs)
 
     Returns:
         Dataset with LSH bands
@@ -818,6 +830,13 @@ def get_or_create_minhash_bands(
             )
         logger.info("Step 1: Generating MinHash signatures (GPU)...")
         # Schema: dict_keys(['*', 'minhash'])
+        gpu_map_kwargs = {
+            'batch_format': 'numpy',
+            'num_gpus': 0.25,  # Request GPU from Ray scheduler
+            'batch_size': gpu_batch_size,  # Larger batches for better GPU utilization
+        }
+        if gpu_concurrency is not None:
+            gpu_map_kwargs['concurrency'] = gpu_concurrency
         ds_with_minhash = ds.map_batches(
             generate_minhash_signatures_gpu,
             fn_kwargs={
@@ -826,9 +845,7 @@ def get_or_create_minhash_bands(
                 'ngram_size': ngram_size,
                 'seed': seed,
             },
-            batch_format='numpy',
-            num_gpus=1,  # Request GPU from Ray scheduler
-            batch_size=gpu_batch_size,  # Larger batches for better GPU utilization
+            **gpu_map_kwargs,
         )
     else:
         logger.info("Step 1: Generating MinHash signatures (CPU)...")
@@ -854,9 +871,7 @@ def get_or_create_minhash_bands(
                 'num_bands': num_bands,
                 'rows_per_band': rows_per_band,
             },
-            batch_format='numpy',
-            num_gpus=1,  # Request GPU from Ray scheduler for cudf/pylibcudf operations
-            batch_size=gpu_batch_size,  # Larger batches for better GPU utilization
+            **gpu_map_kwargs,  # Reuse the same GPU kwargs
         )
     else:
         logger.info("Step 2: Generating LSH bands (CPU)...")
@@ -1044,6 +1059,13 @@ def main():
         default=4096,
         help="Batch size for GPU processing (larger = better GPU utilization)",
     )
+    parser.add_argument(
+        "--gpu-concurrency",
+        type=int,
+        default=None,
+        help="Number of concurrent GPU tasks (default: auto, based on available GPUs). "
+             "Set higher (e.g., 2x num_gpus) to improve GPU utilization through pipelining.",
+    )
 
     args = parser.parse_args()
     if args.disable_progress_bars:
@@ -1088,7 +1110,11 @@ def main():
         output_blocks=args.parallelism,
         use_gpu=args.use_gpu,
         gpu_batch_size=args.gpu_batch_size,
+        gpu_concurrency=args.gpu_concurrency,
     )
+
+    # TODO: remove this after testing
+    return
 
     # Duplicate components: Schema: ['node', 'parent']
     duplicate_components = find_duplicate_components(
