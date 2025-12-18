@@ -277,7 +277,11 @@ class GPUMinHashGenerator:
     GPU-accelerated MinHash signature generator using CuPy and MurmurHash3.
 
     This class provides the same interface as MinHashGenerator but uses GPU
-    acceleration for the permutation computations.
+    acceleration for the permutation computations and n-gram generation.
+
+    N-gram generation uses pylibcudf.nvtext.generate_ngrams.generate_character_ngrams
+    for fully GPU-accelerated character n-gram extraction.
+    See: https://docs.rapids.ai/api/cudf/stable/pylibcudf/api_docs/nvtext/generate_ngrams/
     """
 
     def __init__(
@@ -318,8 +322,8 @@ class GPUMinHashGenerator:
         # Pre-allocate max hash array on GPU
         self.max_hash_gpu = cp.full(num_perm, MAX_HASH, dtype=cp.uint32)
 
-    def _ngrams(self, text: str) -> List[str]:
-        """Generate character n-grams from text as a list of strings."""
+    def _ngrams_cpu(self, text: str) -> List[str]:
+        """Generate character n-grams from text as a list of strings (CPU fallback)."""
         if self.lowercase:
             text = text.lower()
         return [
@@ -327,28 +331,53 @@ class GPUMinHashGenerator:
             for i in range(len(text) - self.ngram_size + 1)
         ]
 
-    def _hash_ngrams_gpu(self, ngrams_list: List[str]) -> cp.ndarray:
+    def _generate_ngrams_gpu(self, texts_series: "cudf.Series") -> "cudf.Series":
         """
-        Hash a list of n-grams using GPU-native MurmurHash3 via pylibcudf.
+        Generate character n-grams on GPU using pylibcudf.nvtext.generate_character_ngrams.
 
-        Uses pylibcudf.hashing.murmurhash3_x86_32 for fully GPU-accelerated hashing.
-        See: https://docs.rapids.ai/api/cudf/stable/pylibcudf/api_docs/hashing/#pylibcudf.hashing.murmurhash3_x86_32
+        This function generates n-grams entirely on the GPU, avoiding CPU-GPU data transfer
+        for the n-gram generation step.
 
         Args:
-            ngrams_list: List of n-gram strings
+            texts_series: cudf Series of strings
+
+        Returns:
+            cudf Series (list type) where each element is a list of n-gram strings
+        """
+        # Apply lowercase on GPU if needed
+        if self.lowercase:
+            texts_series = texts_series.str.lower()
+
+        # Get the underlying pylibcudf column
+        plc_column = texts_series._column.to_pylibcudf(mode="read")
+
+        # Generate character n-grams on GPU
+        # Returns a lists column where each row contains the n-grams for that string
+        ngrams_column = pylibcudf.nvtext.generate_ngrams.generate_character_ngrams(
+            plc_column,
+            ngrams=self.ngram_size
+        )
+
+        # Convert back to cudf Series
+        return cudf.Series.from_pylibcudf(ngrams_column)
+
+    def _hash_ngrams_column_gpu(self, ngrams_flat_series: "cudf.Series") -> cp.ndarray:
+        """
+        Hash a cudf Series of n-grams using GPU-native MurmurHash3 via pylibcudf.
+
+        Uses pylibcudf.hashing.murmurhash3_x86_32 for fully GPU-accelerated hashing.
+
+        Args:
+            ngrams_flat_series: cudf Series of n-gram strings (already on GPU)
 
         Returns:
             CuPy array of 32-bit hash values on GPU
         """
-        if len(ngrams_list) == 0:
+        if len(ngrams_flat_series) == 0:
             return cp.array([], dtype=cp.uint32)
 
-        # Create a cudf Series from the n-grams (strings)
-        ngrams_series = cudf.Series(ngrams_list, dtype='str')
-
         # Convert to pylibcudf Table for hashing
-        # pylibcudf.hashing.murmurhash3_x86_32 takes a Table as input
-        plc_table = pylibcudf.Table([ngrams_series._column.to_pylibcudf(mode="read")])
+        plc_table = pylibcudf.Table([ngrams_flat_series._column.to_pylibcudf(mode="read")])
 
         # Compute MurmurHash3 32-bit hash on GPU
         hash_column = pylibcudf.hashing.murmurhash3_x86_32(plc_table, self.seed)
@@ -364,14 +393,18 @@ class GPUMinHashGenerator:
         Returns:
             Array of shape (num_perm,) with uint32 values
         """
-        ngrams = self._ngrams(text)
+        # For single text, use CPU n-gram generation (GPU overhead not worth it)
+        ngrams = self._ngrams_cpu(text)
 
         if len(ngrams) == 0:
             # Empty text gets max hash values
             return cp.asnumpy(self.max_hash_gpu)
 
+        # Create cudf Series from n-grams for GPU hashing
+        ngrams_series = cudf.Series(ngrams, dtype='str')
+
         # Hash n-grams on GPU using pylibcudf's MurmurHash3
-        hashes_gpu = self._hash_ngrams_gpu(ngrams).astype(cp.uint64)
+        hashes_gpu = self._hash_ngrams_column_gpu(ngrams_series).astype(cp.uint64)
 
         # Apply permutations on GPU: (h * a + b) % prime
         # Broadcasting: hashes_gpu[:, None] has shape (num_tokens, 1)
@@ -389,9 +422,10 @@ class GPUMinHashGenerator:
         Compute MinHash signatures for a batch of texts using GPU.
 
         This method is fully optimized for batch processing:
+        - N-gram generation is done entirely on GPU using pylibcudf.nvtext.generate_character_ngrams
         - All permutations are applied in a single GPU kernel
         - Segmented min is computed using cuDF's optimized groupby
-        - Only one CPU-GPU transfer at the end
+        - Minimal CPU-GPU transfer (only texts in, signatures out)
 
         Args:
             texts: List of text strings
@@ -401,22 +435,48 @@ class GPUMinHashGenerator:
         """
         num_texts = len(texts)
 
-        # Process texts and collect all ngrams with text indices
-        all_ngrams_flat = []
-        text_indices = []
+        if num_texts == 0:
+            return np.full((0, self.num_perm), MAX_HASH, dtype=np.uint32)
 
-        for i, text in enumerate(texts):
-            ngrams = self._ngrams(text)
-            if len(ngrams) > 0:
-                all_ngrams_flat.extend(ngrams)
-                text_indices.extend([i] * len(ngrams))
+        # Create cudf Series from texts - this transfers data to GPU
+        texts_series = cudf.Series(texts, dtype='str')
 
-        if len(all_ngrams_flat) == 0:
-            # All texts are empty
+        # Generate n-grams entirely on GPU
+        # Returns a list column where each row is a list of n-grams for that text
+        ngrams_list_series = self._generate_ngrams_gpu(texts_series)
+
+        # Get the lengths of each n-gram list to identify texts with no n-grams
+        # (texts shorter than ngram_size will have empty lists)
+        ngram_counts = ngrams_list_series.list.len()
+
+        # Check if all texts have no n-grams
+        total_ngrams = ngram_counts.sum()
+        if total_ngrams == 0:
             return np.full((num_texts, self.num_perm), MAX_HASH, dtype=np.uint32)
 
-        # Batch hash all n-grams on GPU using pylibcudf's MurmurHash3
-        all_hashes_gpu = self._hash_ngrams_gpu(all_ngrams_flat).astype(cp.uint64)
+        # Explode the list column to get (text_idx, ngram) pairs
+        # Create a DataFrame with text indices before exploding
+        df = cudf.DataFrame({
+            'text_idx': cudf.Series(cp.arange(num_texts, dtype=cp.int32)),
+            'ngrams': ngrams_list_series
+        })
+
+        # Explode: each row becomes multiple rows (one per n-gram)
+        # This is done entirely on GPU
+        exploded = df.explode('ngrams')
+
+        # Remove rows where ngrams is null (texts with no n-grams)
+        exploded = exploded.dropna(subset=['ngrams'])
+
+        if len(exploded) == 0:
+            return np.full((num_texts, self.num_perm), MAX_HASH, dtype=np.uint32)
+
+        # Extract the flattened n-grams and their text indices
+        text_indices_gpu = cp.asarray(exploded['text_idx'].values)
+        ngrams_flat = exploded['ngrams']
+
+        # Hash all n-grams on GPU
+        all_hashes_gpu = self._hash_ngrams_column_gpu(ngrams_flat).astype(cp.uint64)
 
         # Apply permutations to ALL hashes at once (single GPU kernel)
         # all_hashes_gpu[:, None] has shape (total_ngrams, 1)
@@ -426,9 +486,6 @@ class GPUMinHashGenerator:
 
         # Use cuDF for efficient GPU-accelerated segmented min
         # Build DataFrame with text_idx and permutation values
-        text_indices_gpu = cp.asarray(text_indices, dtype=cp.int32)
-
-        # Create cuDF DataFrame with all data on GPU
         data = {'text_idx': cudf.Series(text_indices_gpu)}
         for p in range(self.num_perm):
             data[f'p{p}'] = cudf.Series(all_phv[:, p])
@@ -832,7 +889,7 @@ def get_or_create_minhash_bands(
         # Schema: dict_keys(['*', 'minhash'])
         gpu_map_kwargs = {
             'batch_format': 'numpy',
-            'num_gpus': 0.25,  # Request GPU from Ray scheduler
+            'num_gpus': 0.5, # 0.25,  # Request GPU from Ray scheduler
             'batch_size': gpu_batch_size,  # Larger batches for better GPU utilization
         }
         if gpu_concurrency is not None:
