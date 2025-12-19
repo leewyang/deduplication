@@ -14,6 +14,7 @@ Architecture:
 from typing import Dict, List, Set, Tuple, Optional
 
 import argparse
+import glob as glob_module
 import hashlib
 import logging
 import os
@@ -215,7 +216,7 @@ class GPUMinHashGenerator:
             for i in range(len(text) - self.ngram_size + 1)
         ]
 
-    def _generate_ngrams_gpu(self, texts_series: "cudf.Series") -> "cudf.Series":
+    def _ngrams_gpu(self, texts_series: "cudf.Series") -> "cudf.Series":
         """
         Generate character n-grams on GPU using pylibcudf.nvtext.generate_character_ngrams.
 
@@ -327,7 +328,7 @@ class GPUMinHashGenerator:
 
         # Generate n-grams entirely on GPU
         # Returns a list column where each row is a list of n-grams for that text
-        ngrams_list_series = self._generate_ngrams_gpu(texts_series)
+        ngrams_list_series = self._ngrams_gpu(texts_series)
 
         # Get the lengths of each n-gram list to identify texts with no n-grams
         # (texts shorter than ngram_size will have empty lists)
@@ -415,7 +416,7 @@ class GPUMinHashGenerator:
         texts_series = cudf.Series(texts, dtype='str')
 
         # Generate n-grams entirely on GPU
-        ngrams_list_series = self._generate_ngrams_gpu(texts_series)
+        ngrams_list_series = self._ngrams_gpu(texts_series)
 
         # Get the lengths of each n-gram list
         ngram_counts = ngrams_list_series.list.len()
@@ -623,34 +624,6 @@ def generate_minhash_signatures(
     return batch
 
 
-def generate_minhash_signatures_gpu(
-    batch: Dict[str, np.ndarray],
-    text_column: str,
-    num_perm: int,
-    ngram_size: int,
-    seed: int,
-) -> Dict[str, np.ndarray]:
-    """
-    GPU-accelerated Ray Data UDF to generate MinHash signatures for a batch of documents.
-
-    This function is called by map_batches with num_gpus=1 and processes documents
-    using GPU acceleration via CuPy and MurmurHash3.
-
-    For best performance, use larger batch sizes (e.g., 4096+) to amortize
-    GPU memory transfer overhead.
-    """
-    generator = GPUMinHashGenerator(num_perm=num_perm, ngram_size=ngram_size, seed=seed)
-
-    texts = list(batch[text_column])
-
-    # Use batch processing for better GPU efficiency
-    signatures = generator.compute_minhash_batch(texts)
-
-    # Add signatures to batch
-    batch['minhash'] = signatures
-    return batch
-
-
 def generate_lsh_bands(
     batch: Dict[str, np.ndarray],
     num_bands: int,
@@ -703,171 +676,6 @@ def generate_lsh_bands(
         'doc_id': doc_ids,
         'band_id': band_ids,
         'band_hash': np.array(band_hashes),
-    }
-
-
-def generate_lsh_bands_gpu(
-    batch: Dict[str, np.ndarray],
-    num_bands: int,
-    rows_per_band: int,
-) -> Dict[str, np.ndarray]:
-    """
-    GPU-optimized LSH band generation from MinHash signatures.
-
-    Uses pylibcudf's murmurhash3_x64_128 for GPU-accelerated band hashing.
-    See: https://docs.rapids.ai/api/cudf/stable/pylibcudf/api_docs/hashing/#pylibcudf.hashing.murmurhash3_x64_128
-
-    This creates multiple (band_id, band_hash) pairs per document.
-
-    Returns a flattened batch where each row represents one band of one document.
-    """
-    if not CUPY_AVAILABLE:
-        raise ImportError(
-            "GPU mode requested but cudf/pylibcudf not available. "
-            "Install with: pip install cudf-cu12 (or appropriate CUDA version)"
-        )
-
-    minhashes = batch['minhash']
-    num_docs = len(minhashes)
-
-    # Replicate document IDs for each band
-    doc_ids = np.repeat(batch['id'], num_bands)
-
-    # Generate band IDs: [0, 1, ..., num_bands-1] repeated for each doc
-    band_ids = np.tile(np.arange(num_bands), num_docs)
-
-    # Collect all band values as strings for batch GPU hashing
-    # We convert band values to hex strings for consistent hashing
-    band_strings = []
-    for doc_idx, minhash in enumerate(minhashes):
-        for band_idx in range(num_bands):
-            start = band_idx * rows_per_band
-            end = start + rows_per_band
-            band_values = minhash[start:end]
-            # Convert band values to a hex string representation
-            band_strings.append(band_values.tobytes().hex())
-
-    # Create cudf Series for GPU-accelerated hashing
-    band_series = cudf.Series(band_strings, dtype='str')
-
-    # Create pylibcudf Table for hashing
-    plc_table = pylibcudf.Table([band_series._column.to_pylibcudf(mode="read")])
-
-    # Compute MurmurHash3 128-bit hash on GPU (returns Table with two uint64 columns)
-    hash_table = pylibcudf.hashing.murmurhash3_x64_128(plc_table, seed=0)
-
-    # Convert first column to hex strings for band_hash (use first 64 bits)
-    hash_col = cudf.Series.from_pylibcudf(hash_table.columns()[0])
-    band_hashes = hash_col.to_pandas().apply(lambda x: format(x, '016x')).values
-
-    return {
-        'doc_id': doc_ids,
-        'band_id': band_ids,
-        'band_hash': np.array(band_hashes),
-    }
-
-
-def generate_minhash_and_lsh_bands_gpu(
-    batch: Dict[str, np.ndarray],
-    text_column: str,
-    num_perm: int,
-    ngram_size: int,
-    seed: int,
-    num_bands: int,
-    rows_per_band: int,
-) -> Dict[str, np.ndarray]:
-    """
-    Combined GPU-accelerated MinHash signature and LSH band generation.
-
-    This function combines generate_minhash_signatures_gpu and generate_lsh_bands_gpu
-    into a single operation, keeping data on the GPU throughout to avoid unnecessary
-    CPU-GPU transfers.
-
-    The workflow:
-    1. Generate MinHash signatures on GPU (keep on GPU as CuPy array)
-    2. Generate LSH bands directly from GPU signatures
-    3. Only transfer final band hashes back to CPU
-
-    Args:
-        batch: Input batch with text data
-        text_column: Name of the column containing text
-        num_perm: Number of MinHash permutations
-        ngram_size: Size of character n-grams
-        seed: Random seed for hash functions
-        num_bands: Number of LSH bands
-        rows_per_band: Number of rows (hash values) per band
-
-    Returns:
-        Dict with 'doc_id', 'band_id', 'band_hash' arrays
-    """
-    if not CUPY_AVAILABLE:
-        raise ImportError(
-            "GPU mode requested but cudf/pylibcudf not available. "
-            "Install RAPIDS cuDF: https://docs.rapids.ai/install"
-        )
-
-    # Create generator (coefficients are cached on GPU)
-    generator = GPUMinHashGenerator(num_perm=num_perm, ngram_size=ngram_size, seed=seed)
-
-    texts = list(batch[text_column])
-    num_docs = len(texts)
-
-    if num_docs == 0:
-        return {
-            'doc_id': np.array([], dtype=batch['id'].dtype),
-            'band_id': np.array([], dtype=np.int32),
-            'band_hash': np.array([], dtype='<U16'),
-        }
-
-    # Step 1: Generate MinHash signatures on GPU (stays on GPU)
-    minhashes_gpu = generator.compute_minhash_batch_gpu(texts)
-
-    # Step 2: Generate LSH bands directly from GPU data
-    # Replicate document IDs for each band
-    doc_ids = np.repeat(batch['id'], num_bands)
-
-    # Generate band IDs: [0, 1, ..., num_bands-1] repeated for each doc
-    band_ids = np.tile(np.arange(num_bands, dtype=np.int32), num_docs)
-
-    # Create band indices on GPU for efficient slicing
-    # Each band extracts rows_per_band consecutive values from the minhash
-    # Shape: (num_docs * num_bands, rows_per_band)
-    band_values_list = []
-    for band_idx in range(num_bands):
-        start = band_idx * rows_per_band
-        end = start + rows_per_band
-        # Extract band slice for all documents at once: shape (num_docs, rows_per_band)
-        band_slice = minhashes_gpu[:, start:end]
-        band_values_list.append(band_slice)
-
-    # Stack all bands: shape (num_bands, num_docs, rows_per_band) -> reshape to (num_docs * num_bands, rows_per_band)
-    all_bands_gpu = cp.stack(band_values_list, axis=0)  # (num_bands, num_docs, rows_per_band)
-    all_bands_gpu = cp.transpose(all_bands_gpu, (1, 0, 2))  # (num_docs, num_bands, rows_per_band)
-    all_bands_gpu = all_bands_gpu.reshape(-1, rows_per_band)  # (num_docs * num_bands, rows_per_band)
-
-    # Hash each band's values using GPU
-    # Convert band values to a format suitable for hashing
-    # We'll hash each row of values together using xxhash-style combining on GPU
-
-    # Approach: Use the band values directly to create a composite hash
-    # Combine row values using polynomial rolling hash on GPU
-    # h = sum(val[i] * prime^i) mod 2^64
-    prime = cp.uint64(31)
-    powers = prime ** cp.arange(rows_per_band, dtype=cp.uint64)
-
-    # Compute hash for each band: dot product of values with powers
-    # all_bands_gpu: (num_docs * num_bands, rows_per_band), uint32
-    # powers: (rows_per_band,), uint64
-    band_hashes_gpu = cp.dot(all_bands_gpu.astype(cp.uint64), powers)
-
-    # Convert to hex strings (transfer to CPU only at the end)
-    band_hashes_cpu = cp.asnumpy(band_hashes_gpu)
-    band_hashes = np.array([format(h, '016x') for h in band_hashes_cpu])
-
-    return {
-        'doc_id': doc_ids,
-        'band_id': band_ids,
-        'band_hash': band_hashes,
     }
 
 
@@ -1374,7 +1182,7 @@ def main():
     )
 
     # TODO: remove this after testing
-    return
+    # return
 
     # Duplicate components: Schema: ['node', 'parent']
     duplicate_components = find_duplicate_components(
@@ -1575,7 +1383,6 @@ def test_gpu_minhash():
             print("  ✗ Exact duplicate texts have different GPU signatures")
 
     # Check 3: Similar texts should have high similarity
-    similar_sim_cpu = estimate_jaccard(cpu_signatures[0], cpu_signatures[1])
     similar_sim_gpu = estimate_jaccard(gpu_signatures[0], gpu_signatures[1])
     if similar_sim_gpu > 0.5:
         print(f"  ✓ Similar texts have high similarity (GPU: {similar_sim_gpu:.4f})")
