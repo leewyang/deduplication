@@ -11,21 +11,26 @@ Architecture:
 2. LSH banding to generate candidate pairs (flatmap + groupby)
 3. Connected components to find duplicate clusters (iterative map-reduce)
 """
+from typing import Dict, List, Set, Tuple, Optional
 
 import argparse
-import glob as glob_module
 import hashlib
 import logging
+import os
 import struct
-from typing import Dict, List, Set, Tuple, Optional
 
 import numpy as np
 import pyarrow as pa
-from pyarrow import fs as pafs
 import pandas as pd
 import ray
+
 from scipy import integrate
-import os
+
+from util import (
+    check_path_exists,
+    list_parquet_files
+)
+
 
 # Optional GPU imports - will be imported lazily when needed
 try:
@@ -44,127 +49,6 @@ logger = logging.getLogger(__name__)
 # Constants
 MERSENNE_PRIME = np.uint64((1 << 61) - 1)
 MAX_HASH = np.uint32((1 << 32) - 1)
-
-
-def _is_gcs_path(path: str) -> bool:
-    """Check if a path is a GCS path."""
-    return path.startswith("gs://")
-
-
-def check_path_exists(path: str) -> bool:
-    """Check if a path exists (supports both GCS and local paths)."""
-    if _is_gcs_path(path):
-        return check_gcs_path_exists(path)
-    else:
-        return check_local_path_exists(path)
-
-
-def check_local_path_exists(path: str) -> bool:
-    """Check if a local path exists."""
-    return os.path.exists(path)
-
-
-def check_gcs_path_exists(path: str) -> bool:
-    """Check if a GCS path exists."""
-    gcs_fs = pafs.GcsFileSystem()
-
-    # Remove gs:// prefix if present
-    if path.startswith("gs://"):
-        path = path[5:]
-
-    # Remove trailing slash
-    path = path.rstrip("/")
-
-    logger.info(f"Listing parquet files in gs://{path}")
-
-    # Use FileSelector with recursive=True
-    selector = pafs.FileSelector(path, recursive=True)
-    file_infos = gcs_fs.get_file_info(selector)
-    return len(file_infos) > 0
-
-
-def list_parquet_files(path: str) -> List[str]:
-    """
-    List all parquet files in a directory recursively (supports both GCS and local paths).
-
-    Args:
-        path: Path to directory (GCS path like gs://bucket/path/ or local path)
-
-    Returns:
-        List of full paths to parquet files
-    """
-    if _is_gcs_path(path):
-        return list_gcs_parquet_files(path)
-    else:
-        return list_local_parquet_files(path)
-
-
-def list_local_parquet_files(path: str) -> List[str]:
-    """
-    List all parquet files in a local directory recursively.
-
-    Args:
-        path: Local path to directory
-
-    Returns:
-        List of full local paths to parquet files
-    """
-    path = path.rstrip("/")
-    logger.info(f"Listing parquet files in {path}")
-
-    parquet_files = []
-
-    if os.path.isfile(path):
-        # Single file
-        if path.endswith('.parquet'):
-            parquet_files.append(path)
-    elif os.path.isdir(path):
-        # Directory - search recursively
-        pattern = os.path.join(path, "**", "*.parquet")
-        parquet_files = glob_module.glob(pattern, recursive=True)
-    else:
-        # Could be a glob pattern
-        parquet_files = [f for f in glob_module.glob(path, recursive=True) if f.endswith('.parquet')]
-
-    logger.info(f"Found {len(parquet_files)} parquet files")
-    return parquet_files
-
-
-def list_gcs_parquet_files(path: str) -> List[str]:
-    """
-    List all parquet files in a GCS directory recursively using PyArrow.
-
-    Args:
-        path: GCS path (e.g., gs://bucket/path/)
-
-    Returns:
-        List of full GCS paths to parquet files
-    """
-    # Create GCS filesystem
-    gcs_fs = pafs.GcsFileSystem()
-
-    # Remove gs:// prefix if present
-    if path.startswith("gs://"):
-        path = path[5:]
-
-    # Remove trailing slash
-    path = path.rstrip("/")
-
-    logger.info(f"Listing parquet files in gs://{path}")
-
-    # Use FileSelector with recursive=True
-    selector = pafs.FileSelector(path, recursive=True)
-    file_infos = gcs_fs.get_file_info(selector)
-
-    # Filter for parquet files
-    parquet_files = []
-    for file_info in file_infos:
-        if file_info.type == pafs.FileType.File and file_info.path.endswith('.parquet'):
-            parquet_files.append(f"gs://{file_info.path}")
-
-    logger.info(f"Found {len(parquet_files)} parquet files")
-
-    return parquet_files
 
 
 def sha1_hash32(data: bytes) -> int:
@@ -584,6 +468,137 @@ class GPUMinHashGenerator:
         results[valid_indices] = grouped_values
 
         return results
+
+
+class GPUMinHashAndLSHBandsGenerator:
+    """
+    Ray Data callable class for GPU-accelerated MinHash + LSH band generation.
+
+    This class is designed to be used with Ray Data's map_batches function.
+    It initializes the GPU permutation arrays ONCE per worker (per GPU), avoiding
+    redundant computation and GPU memory transfers across batches.
+
+    Usage with Ray Data:
+        ds.map_batches(
+            GPUMinHashAndLSHBandsGenerator,
+            fn_constructor_kwargs={
+                'text_column': 'text',
+                'num_perm': 128,
+                'ngram_size': 5,
+                'seed': 42,
+                'num_bands': 16,
+                'rows_per_band': 8,
+            },
+            batch_format='numpy',
+            batch_size=4096,
+            num_gpus=1,
+            concurrency=num_gpus,  # One actor per GPU
+        )
+    """
+
+    def __init__(
+        self,
+        text_column: str,
+        num_perm: int = 128,
+        ngram_size: int = 5,
+        seed: int = 42,
+        num_bands: int = 16,
+        rows_per_band: int = 8,
+    ):
+        """
+        Initialize the generator with MinHash parameters.
+
+        The GPU permutation arrays are created here, once per worker.
+        """
+        if not CUPY_AVAILABLE:
+            raise ImportError(
+                "CuPy, cuDF, and pylibcudf are required for GPU MinHash. "
+                "Install RAPIDS cuDF: https://docs.rapids.ai/install"
+            )
+
+        self.text_column = text_column
+        self.num_perm = num_perm
+        self.ngram_size = ngram_size
+        self.seed = seed
+        self.num_bands = num_bands
+        self.rows_per_band = rows_per_band
+
+        # Initialize the GPU MinHash generator (permutations are computed and
+        # transferred to GPU ONCE here, not per batch)
+        self.generator = GPUMinHashGenerator(
+            num_perm=num_perm,
+            ngram_size=ngram_size,
+            seed=seed,
+        )
+
+        # Pre-compute powers for band hashing (stays on GPU)
+        prime = cp.uint64(31)
+        self.powers = prime ** cp.arange(rows_per_band, dtype=cp.uint64)
+
+        logger.info(
+            f"GPUMinHashAndLSHBandsGenerator initialized on GPU "
+            f"(num_perm={num_perm}, ngram_size={ngram_size}, "
+            f"num_bands={num_bands}, rows_per_band={rows_per_band})"
+        )
+
+    def __call__(self, batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        Process a batch of documents to generate MinHash signatures and LSH bands.
+
+        Args:
+            batch: Input batch with text data
+
+        Returns:
+            Dict with 'doc_id', 'band_id', 'band_hash' arrays
+        """
+        texts = list(batch[self.text_column])
+        num_docs = len(texts)
+
+        if num_docs == 0:
+            return {
+                'doc_id': np.array([], dtype=batch['id'].dtype),
+                'band_id': np.array([], dtype=np.int32),
+                'band_hash': np.array([], dtype='<U16'),
+            }
+
+        # Step 1: Generate MinHash signatures on GPU (stays on GPU)
+        # Uses cached permutation arrays from self.generator
+        minhashes_gpu = self.generator.compute_minhash_batch_gpu(texts)
+
+        # Step 2: Generate LSH bands directly from GPU data
+        # Replicate document IDs for each band
+        doc_ids = np.repeat(batch['id'], self.num_bands)
+
+        # Generate band IDs: [0, 1, ..., num_bands-1] repeated for each doc
+        band_ids = np.tile(np.arange(self.num_bands, dtype=np.int32), num_docs)
+
+        # Extract all bands at once on GPU
+        band_values_list = []
+        for band_idx in range(self.num_bands):
+            start = band_idx * self.rows_per_band
+            end = start + self.rows_per_band
+            # Extract band slice for all documents at once: shape (num_docs, rows_per_band)
+            band_slice = minhashes_gpu[:, start:end]
+            band_values_list.append(band_slice)
+
+        # Stack all bands: shape (num_bands, num_docs, rows_per_band) -> reshape
+        all_bands_gpu = cp.stack(band_values_list, axis=0)  # (num_bands, num_docs, rows_per_band)
+        all_bands_gpu = cp.transpose(all_bands_gpu, (1, 0, 2))  # (num_docs, num_bands, rows_per_band)
+        all_bands_gpu = all_bands_gpu.reshape(-1, self.rows_per_band)  # (num_docs * num_bands, rows_per_band)
+
+        # Hash each band's values using GPU with pre-computed powers
+        # Compute hash for each band: dot product of values with powers
+        band_hashes_gpu = cp.dot(all_bands_gpu.astype(cp.uint64), self.powers)
+
+        # Convert to hex strings (transfer to CPU only at the end)
+        band_hashes_cpu = cp.asnumpy(band_hashes_gpu)
+        band_hashes = np.array([format(h, '016x') for h in band_hashes_cpu])
+
+        return {
+            'doc_id': doc_ids,
+            'band_id': band_ids,
+            'band_hash': band_hashes,
+        }
 
 
 def generate_minhash_signatures(
@@ -1022,7 +1037,8 @@ def get_or_create_minhash_bands(
         output_blocks: int = 100,
         use_gpu: bool = False,
         gpu_batch_size: int = 4096,
-        num_gpus_per_task: float = 1.0) -> ray.data.Dataset:
+        num_gpus_per_task: float = 1.0,
+        num_gpu_actors: Optional[int] = None) -> ray.data.Dataset:
     """
     Generate MinHash signatures and LSH bands for a dataset.
 
@@ -1038,6 +1054,9 @@ def get_or_create_minhash_bands(
         use_gpu: Whether to use GPU acceleration
         gpu_batch_size: Batch size for GPU processing (larger = better GPU utilization)
         num_gpus_per_task: Number of GPUs per task (default: 1.0)
+        num_gpu_actors: Number of GPU actors to use (default: None, auto-determined by Ray).
+            Each actor caches GPU permutation arrays, so setting this to the number of
+            available GPUs maximizes permutation reuse.
 
     Returns:
         Dataset with LSH bands
@@ -1066,17 +1085,11 @@ def get_or_create_minhash_bands(
                 "GPU mode requested but cudf/pylibcudf not available. "
                 "Install RAPIDS cuDF: https://docs.rapids.ai/install"
             )
-        # Use combined GPU function to avoid CPU-GPU data transfer between steps
-        logger.info("Generating MinHash signatures and LSH bands (combined GPU, no CPU transfer)...")
-        gpu_map_kwargs = {
-            'batch_format': 'numpy',
-            'batch_size': gpu_batch_size,  # Larger batches for better GPU utilization
-            'num_gpus': num_gpus_per_task,
-        }
+        # Use callable class for GPU processing - permutations initialized ONCE per GPU worker
+        logger.info("Generating MinHash signatures and LSH bands (GPU actor class, permutations cached per GPU)...")
         # Schema: ['doc_id', 'band_id', 'band_hash']
-        bands_ds: ray.data.Dataset = ds.map_batches(
-            generate_minhash_and_lsh_bands_gpu,
-            fn_kwargs={
+        map_batches_kwargs = {
+            'fn_constructor_kwargs': {
                 'text_column': text_column,
                 'num_perm': num_perm,
                 'ngram_size': ngram_size,
@@ -1084,7 +1097,16 @@ def get_or_create_minhash_bands(
                 'num_bands': num_bands,
                 'rows_per_band': rows_per_band,
             },
-            **gpu_map_kwargs,
+            'batch_format': 'numpy',
+            'batch_size': gpu_batch_size,  # Larger batches for better GPU utilization
+            'num_gpus': num_gpus_per_task,
+        }
+        # Set concurrency if specified (one actor per GPU for efficient permutation reuse)
+        if num_gpu_actors is not None:
+            map_batches_kwargs['concurrency'] = num_gpu_actors
+        bands_ds: ray.data.Dataset = ds.map_batches(
+            GPUMinHashAndLSHBandsGenerator,
+            **map_batches_kwargs,
         )
     else:
         # CPU path: two separate steps
@@ -1295,6 +1317,14 @@ def main():
         help="Number of GPUs per task (default: 1.0). "
              "Set lower (e.g., 0.5) to improve GPU utilization through pipelining.",
     )
+    parser.add_argument(
+        "--num-gpu-actors",
+        type=int,
+        default=None,
+        help="Number of GPU actors to use (default: auto-determined by Ray). "
+             "Each actor caches GPU permutation arrays once, so setting this "
+             "to the number of available GPUs maximizes permutation reuse.",
+    )
 
     args = parser.parse_args()
     if args.disable_progress_bars:
@@ -1340,6 +1370,7 @@ def main():
         use_gpu=args.use_gpu,
         gpu_batch_size=args.gpu_batch_size,
         num_gpus_per_task=args.num_gpus_per_task,
+        num_gpu_actors=args.num_gpu_actors,
     )
 
     # TODO: remove this after testing
