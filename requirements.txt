@@ -1,3 +1,4 @@
+datasets
 gcsfs
 google-cloud-storage
 ray[default]
