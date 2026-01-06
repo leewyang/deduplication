@@ -129,11 +129,19 @@ class GPUMinHash(ABC):
         return minhash_method(text_series)
 
 
+class GPUMinHashActor(GPUMinHash):
+    def __call__(self, batch):
+        text_series = cudf.Series(batch["text"])
+        hashes = super().compute_minhashes(text_series).list.leaves.values.get().reshape(-1, 260)
+        return {"minhashes": hashes}
+
+
 if __name__ == "__main__":
     import glob
     import pandas as pd
     import ray
     import time
+    import ray
 
     input_files = sorted(glob.glob("/raid/spark-team/leey/ray-data/fineweb-edu-10/*.parquet"))
     generator = GPUMinHash(seed=42, num_hashes=260, char_ngrams=24, use_64bit_hash=False, pool=True)
@@ -214,7 +222,7 @@ if __name__ == "__main__":
     stop_to_numpy = time.time()
     logger.info(f"===== cuDF (concat + numpy): to_numpy: {stop_to_numpy - start_to_numpy} seconds")
     cudf_numpy_time = stop_to_numpy - start
-    logger.debug(pdf)
+    logger.debug(df)
     logger.info(f"===== cuDF (concat + numpy): {cudf_numpy_time} seconds")
 
     # cuDF: everything on GPU, results in list of pandas Series, then to pandas concat
@@ -235,7 +243,7 @@ if __name__ == "__main__":
     ray.init()
 
     # disable progress bars
-    ray.data.DataContext.get_current().enable_progress_bars = False
+    # ray.data.DataContext.get_current().enable_progress_bars = False
 
     # Ray: minhash on GPU, input and output on CPU, pandas batch format
     start = time.time()
@@ -244,7 +252,7 @@ if __name__ == "__main__":
         minhashes = generator.compute_minhashes(text_series).to_pandas()
         return pd.DataFrame({"minhashes": minhashes})
     ds = ray.data.read_parquet(input_files)
-    minhashes = ds.map_batches(minhash_gpu, batch_format='pandas', batch_size=1000*10, num_gpus=1)
+    minhashes = ds.map_batches(minhash_gpu, batch_format='pandas', batch_size=1000*100, num_gpus=1)
     minhashes = minhashes.to_pandas()
     stop = time.time()
     ray_time = stop - start
@@ -258,9 +266,23 @@ if __name__ == "__main__":
         minhashes = generator.compute_minhashes(text_series).list.leaves.values.get().reshape(-1, 260)
         return {"minhashes": minhashes}
     ds = ray.data.read_parquet(input_files)
-    minhashes = ds.map_batches(minhash_gpu, batch_format='numpy', batch_size=1000*10, num_gpus=1)
+    minhashes = ds.map_batches(minhash_gpu, batch_format='numpy', batch_size=1000*100, num_gpus=1)
     minhashes = minhashes.to_pandas()
     stop = time.time()
     ray_numpy_time = stop - start
     logger.debug(minhashes)
     logger.info(f"===== Ray (numpy): {ray_numpy_time} seconds")
+
+    # Ray: GPU actor class, input and output on CPU, numpy batch format
+    start = time.time()
+    ds = ray.data.read_parquet(input_files)
+    minhashes = ds.map_batches(
+        GPUMinHashActor,
+        compute=ray.data.ActorPoolStrategy(min_size=1, max_size=16),
+        batch_size=1000*100,
+        num_gpus=1,
+    )
+    minhashes = minhashes.to_pandas()
+    stop = time.time()
+    ray_gpu_actor_time = stop - start
+    logger.info(f"===== Ray (GPU actor): {ray_gpu_actor_time} seconds")
