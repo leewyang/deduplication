@@ -1182,7 +1182,7 @@ def main():
     )
 
     # TODO: remove this after testing
-    # return
+    return
 
     # Duplicate components: Schema: ['node', 'parent']
     duplicate_components = find_duplicate_components(
