@@ -1,7 +1,6 @@
 import glob
 import os
 
-import pyarrow.feather as feather
 import pyarrow.parquet as pq
 import pyarrow as pa
 

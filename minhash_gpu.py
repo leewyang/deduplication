@@ -138,13 +138,31 @@ class GPUMinHashActor(GPUMinHash):
 
 if __name__ == "__main__":
     import glob
-    import pandas as pd
-    import ray
     import time
+
+    import pandas as pd
+    import pyarrow as pa
     import ray
 
+    arrow_input_files = sorted(glob.glob("/raid/spark-team/leey/ray-data/fineweb-edu-10/*.arrow"))
     input_files = sorted(glob.glob("/raid/spark-team/leey/ray-data/fineweb-edu-10/*.parquet"))
+
     generator = GPUMinHash(seed=42, num_hashes=260, char_ngrams=24, use_64bit_hash=False, pool=True)
+
+    minhashes_list = []
+    start = time.time()
+    for input_file in arrow_input_files:
+        with pa.memory_map(input_file, 'r') as source:
+            reader = pa.ipc.open_stream(source)
+            table = reader.read_all()
+        df = cudf.DataFrame.from_arrow(table)
+        text_series = df["text"]
+        minhashes = generator.compute_minhashes(text_series)
+        minhashes_list.append(minhashes)
+    stop = time.time()
+    cudf_list_time = stop - start
+    logger.debug(minhashes_list)
+    logger.info(f"===== cuDF (list + arrow): {cudf_list_time} seconds")
 
     # cuDF: everything on GPU, results in list
     minhashes_list = []
@@ -246,13 +264,13 @@ if __name__ == "__main__":
     # ray.data.DataContext.get_current().enable_progress_bars = False
 
     # Ray: minhash on GPU, input and output on CPU, pandas batch format
-    start = time.time()
-    def minhash_gpu(x):
+    def minhash_gpu_pandas(x):
         text_series = cudf.Series(x["text"])
         minhashes = generator.compute_minhashes(text_series).to_pandas()
         return pd.DataFrame({"minhashes": minhashes})
+    start = time.time()
     ds = ray.data.read_parquet(input_files)
-    minhashes = ds.map_batches(minhash_gpu, batch_format='pandas', batch_size=1000*100, num_gpus=1)
+    minhashes = ds.map_batches(minhash_gpu_pandas, batch_format='pandas', batch_size=1000*100, num_gpus=1)
     minhashes = minhashes.to_pandas()
     stop = time.time()
     ray_time = stop - start
@@ -260,13 +278,13 @@ if __name__ == "__main__":
     logger.info(f"===== Ray (pandas): {ray_time} seconds")
 
     # Ray: minhash on GPU, input and output on CPU, numpy batch format
-    start = time.time()
-    def minhash_gpu(x):
+    def minhash_gpu_numpy(x):
         text_series = cudf.Series(x["text"])
         minhashes = generator.compute_minhashes(text_series).list.leaves.values.get().reshape(-1, 260)
         return {"minhashes": minhashes}
+    start = time.time()
     ds = ray.data.read_parquet(input_files)
-    minhashes = ds.map_batches(minhash_gpu, batch_format='numpy', batch_size=1000*100, num_gpus=1)
+    minhashes = ds.map_batches(minhash_gpu_numpy, batch_format='numpy', batch_size=1000*100, num_gpus=1)
     minhashes = minhashes.to_pandas()
     stop = time.time()
     ray_numpy_time = stop - start
@@ -286,3 +304,39 @@ if __name__ == "__main__":
     stop = time.time()
     ray_gpu_actor_time = stop - start
     logger.info(f"===== Ray (GPU actor): {ray_gpu_actor_time} seconds")
+
+    # Ray: arrow input, numpy batch format
+    start = time.time()
+    tables = []
+    for input_file in arrow_input_files:
+        with pa.memory_map(input_file, 'r') as source:
+            reader = pa.ipc.open_stream(source)
+            table = reader.read_all()
+            tables.append(table)
+    ds = ray.data.from_arrow(tables)
+    minhashes = ds.map_batches(minhash_gpu_numpy, batch_format='numpy', batch_size=1000*100, num_gpus=1)
+    minhashes = minhashes.to_pandas()
+    stop = time.time()
+    ray_arrow_numpy_time = stop - start
+    logger.debug(minhashes)
+    logger.info(f"===== Ray (arrow + numpy): {ray_arrow_numpy_time} seconds")
+
+    # Ray: filename i  nput, everything on GPU
+    def minhash_gpu_fused(x):
+        files = x["filename"]
+        minhashes_list = []
+        for file in files:
+            df = cudf.read_parquet(file)
+            text_series = cudf.Series(df["text"])
+            minhashes = generator.compute_minhashes(text_series)
+            minhashes_list.append(minhashes)
+        minhashes = cudf.concat(minhashes_list)
+        return {"minhashes": minhashes.list.leaves.values.get().reshape(-1, 260)}
+    start = time.time()
+    ds = ray.data.from_items([{"filename": filename} for filename in input_files])
+    minhashes = ds.map_batches(minhash_gpu_fused, batch_format='numpy', batch_size=10, num_gpus=1)
+    minhashes = minhashes.materialize()
+    stop = time.time()
+    ray_fused_time = stop - start
+    logger.debug(minhashes)
+    logger.info(f"===== Ray (fused): {ray_fused_time} seconds")
