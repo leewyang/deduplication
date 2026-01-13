@@ -27,7 +27,7 @@ import ray
 from scipy import integrate
 
 from minhash_gpu import GPUMinHash
-from util import list_parquet_files
+from util import check_path_exists, list_parquet_files
 
 
 logger = logging.getLogger(__name__)
@@ -140,6 +140,21 @@ class MinHashGenerator:
 
         # Take minimum across all tokens for each permutation
         return phv.min(axis=0)
+
+
+def generate_minhash_signatures_gpu(
+    batch: Dict[str, np.ndarray],
+    text_column: str,
+    num_perm: int,
+    ngram_size: int,
+    seed: int,
+) -> Dict[str, np.ndarray]:
+    """Generate MinHash signatures for a batch of documents using GPU."""
+    generator = GPUMinHash(seed=seed, num_hashes=num_perm, char_ngrams=ngram_size)
+    texts = batch[text_column]
+    signatures = generator.compute_minhashes(cudf.Series(texts, dtype='str'))
+    batch['minhash'] = signatures.list.leaves.values.get().reshape(-1, num_perm)
+    return batch
 
 
 def generate_minhash_signatures(
@@ -383,16 +398,16 @@ def get_or_create_minhash_bands(
         seed: int,
         output_blocks: int = 100,
         use_gpu: bool = False,
-        gpu_batch_size: int = 1,
+        gpu_batch_size: int = 1000*100,
         num_gpus_per_task: float = 1.0) -> ray.data.Dataset:
 
-    # if minhash_checkpoint_uri is not None:
-    #     if not check_path_exists(minhash_checkpoint_uri):
-    #         raise ValueError(f"Checkpoint URI {minhash_checkpoint_uri} does not exist")
-    #     bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
-    #     bands_ds = bands_ds.repartition(num_blocks=output_blocks)
-    #     bands_ds = bands_ds.materialize()
-    #     return bands_ds
+    if minhash_checkpoint_uri is not None:
+        if not check_path_exists(minhash_checkpoint_uri):
+            raise ValueError(f"Checkpoint URI {minhash_checkpoint_uri} does not exist")
+        bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
+        bands_ds = bands_ds.repartition(num_blocks=output_blocks)
+        bands_ds = bands_ds.materialize()
+        return bands_ds
 
     # Need to materialize first if limiting, or else the limit could be non-deterministic
     ds = ds.materialize()
@@ -406,29 +421,16 @@ def get_or_create_minhash_bands(
     # Step 1: Generate MinHash signatures
     logger.info("Step 1: Generating MinHash signatures...")
     if use_gpu:
-        generator = GPUMinHash(seed=seed, num_hashes=num_perm, char_ngrams=ngram_size)
-        def minhash_gpu_fused(x):
-            files = x["filename"]
-            id_list = []
-            minhash_list = []
-            for file in files:
-                df = cudf.read_parquet(file)
-                id_series = df["id"]
-                text_series = df["text"].str.lower()
-                minhashes = generator.compute_minhashes(text_series)
-                minhash_list.append(minhashes)
-                id_list.append(id_series)
-            ids = cudf.concat(id_list).to_numpy()
-            minhashes = cudf.concat(minhash_list)
-            return {
-                "id": ids,
-                "minhash": minhashes.list.leaves.values.get().reshape(-1, num_perm),
-            }
-
         ds_with_minhash = ds.map_batches(
-            minhash_gpu_fused,
+            generate_minhash_signatures_gpu,
+            fn_kwargs={
+                'text_column': text_column,
+                'num_perm': num_perm,
+                'ngram_size': ngram_size,
+                'seed': seed,
+            },
             batch_format='numpy',
-            batch_size=1,
+            batch_size=gpu_batch_size,
             num_gpus=num_gpus_per_task,
         )
     else:
@@ -636,8 +638,8 @@ def main():
     parser.add_argument(
         "--gpu-batch-size",
         type=int,
-        default=1,
-        help="Number of parquet files to process per GPU batch (default: 1)",
+        default=1000*100,
+        help="Batch size for GPU processing (larger = better GPU utilization)",
     )
     parser.add_argument(
         "--num-gpus-per-task",
@@ -661,11 +663,7 @@ def main():
     list_of_all_input_files = list_parquet_files(input_path)
     logger.info(f"Reading {len(list_of_all_input_files)} parquet files")
 
-    if args.use_gpu:
-        ds = ray.data.from_items([{"filename": f} for f in list_of_all_input_files])
-    else:
-        ds = ray.data.read_parquet(list_of_all_input_files, columns=[args.id_column, args.text_column])
-
+    ds = ray.data.read_parquet(list_of_all_input_files)
     input_count = ds.count()
     print(f"Original input count {input_count}")
     if args.limit is not None:
@@ -703,10 +701,6 @@ def main():
     duplicate_count = duplicate_components.count()
 
     # Join with original dataset to get full document content
-    if args.use_gpu:
-        ds = ray.data.read_parquet(list_of_all_input_files, columns=[args.id_column, args.text_column])
-        input_count = ds.count()
-
     if duplicate_count == 0:
         # No duplicates found, skip the join
         logger.info("No duplicates found, skipping join.")
