@@ -152,7 +152,7 @@ def generate_minhash_signatures_gpu(
     """Generate MinHash signatures for a batch of documents using GPU."""
     generator = GPUMinHash(seed=seed, num_hashes=num_perm, char_ngrams=ngram_size)
     texts = batch[text_column]
-    signatures = generator.compute_minhashes(cudf.Series(texts, dtype='str'))
+    signatures = generator.compute_minhashes(cudf.Series(texts, dtype='str').str.lower())
     batch['minhash'] = signatures.list.leaves.values.get().reshape(-1, num_perm)
     return batch
 
@@ -402,12 +402,13 @@ def get_or_create_minhash_bands(
         num_gpus_per_task: float = 1.0) -> ray.data.Dataset:
 
     if minhash_checkpoint_uri is not None:
-        if not check_path_exists(minhash_checkpoint_uri):
-            raise ValueError(f"Checkpoint URI {minhash_checkpoint_uri} does not exist")
-        bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
-        bands_ds = bands_ds.repartition(num_blocks=output_blocks)
-        bands_ds = bands_ds.materialize()
-        return bands_ds
+        if check_path_exists(minhash_checkpoint_uri):
+            bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
+            bands_ds = bands_ds.repartition(num_blocks=output_blocks)
+            bands_ds = bands_ds.materialize()
+            return bands_ds
+        else:
+            logger.info(f"Checkpoint URI {minhash_checkpoint_uri} does not exist, generating minhash bands from scratch")
 
     # Need to materialize first if limiting, or else the limit could be non-deterministic
     ds = ds.materialize()
