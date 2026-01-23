@@ -107,22 +107,21 @@ def shuffle_gpu(bands_ds: ray.data.Dataset, hash_parallelism: int, num_gpus: int
     ray.get([actor.insert_finished.remote() for actor in actors])
     logger.info(f"Actor pool insert finished complete")
 
-    # read the chunks from the actors
+    # read the shuffled chunks from the actors
     chunks = ray.get([actor.extract_partitions.remote() for actor in actors])
+    logger.info(f"Number of chunks: {len(chunks)}")
+    logger.info(f"Number of items in chunks: {sum([len(chunk) for chunk in chunks])}")
     logger.info(f"Actor pool read complete")
 
-    # convert the chunks to a dataset
-    # TODO: move map_batches to shuffle_gpu to avoid unnecessary data movement
-    shuffled_ds = ray.data.from_arrow(chunks)
-    shuffled_ds.write_parquet("shuffled_gpu.parquet")
+    edges_list = []
+    for chunk in chunks:
+        # TODO: move into extract_partitions to avoid unnecessary data movement
+        edges = create_edges_from_collisions_gpu(chunk)
+        edges_list.append(edges)
+        # pa.parquet.write_table(edges, f"edges_chunk_{i}.parquet")
 
-    edges_ds = shuffled_ds.map_batches(
-        create_edges_from_collisions_gpu,
-        batch_format="pyarrow",
-        batch_size=1000*100,
-        num_gpus=1,
-    )
-
+    # convert the list of pyarrow tables to a ray dataset
+    edges_ds = ray.data.from_arrow(edges_list)
     return edges_ds
 
 
