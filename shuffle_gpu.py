@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Callable, Dict
 
 import logging
 import time
@@ -22,12 +22,20 @@ logger = logging.getLogger(__name__)
 
 @ray.remote(num_gpus=1)
 class GPUShuffleActor(BulkRapidsMPFShuffler):
-    def __init__(self, nranks: int, total_nparts: int, shuffle_on: list[str]):
-        super().__init__(nranks=nranks, total_nparts=total_nparts, shuffle_on=shuffle_on)
-        self.columns = ['doc_id', 'band_id', 'band_hash']
+    def __init__(
+        self,
+        nranks: int,
+        hash_parallelism: int,
+        group_by: list[str],
+        columns: list[str],
+        map_groups_fn: Callable[[cudf.DataFrame], cudf.DataFrame],
+    ):
+        super().__init__(nranks=nranks, total_nparts=hash_parallelism, shuffle_on=group_by)
+        self.columns = columns
+        self.map_groups_fn = map_groups_fn
         logger.info(f"Rank {self.rank} setup complete")
 
-    def insert_batch(self, batch: pa.Table) -> pa.Table:
+    def insert_batch(self, batch: pa.Table) -> int:
         df = cudf.DataFrame.from_arrow(batch)
         # self.columns = list(df.columns)
         self.insert_chunk(table=df, column_names=self.columns)
@@ -37,23 +45,23 @@ class GPUShuffleActor(BulkRapidsMPFShuffler):
         partitions = []
         for partition_id, partition in self.extract():
             partitions.append(partition)
+        # TODO: can this be done in a streaming manner?
         cdfs = [pylibcudf_to_cudf_dataframe(partition, self.columns) for partition in partitions]
         cdf = cudf.concat(cdfs)
-        result = cdf.to_arrow()
-        return result
+        result = self.map_groups_fn(cdf)
+        return result.to_arrow()
 
-def create_edges_from_collisions_gpu(batch: pa.Table) -> pa.Table:
+def create_edges_from_collisions_gpu(cdf: cudf.DataFrame) -> cudf.DataFrame:
     """Create edges from a batch of candidate pairs that collide."""
-    df = cudf.DataFrame.from_arrow(batch)
-    df['count'] = 1
+    cdf['count'] = 1
     grouped_df = (
-        df.groupby(['band_id', 'band_hash'])
+        cdf.groupby(['band_id', 'band_hash'])
         .agg({'doc_id': 'min', 'count': 'sum'})
         .reset_index().rename(columns={'doc_id': 'src', 'count': 'count'})
     )
     grouped_df = grouped_df.loc[grouped_df['count'] > 1]
-    df = df.merge(grouped_df, on=['band_id', 'band_hash'], how='inner').rename(columns={'doc_id': 'dst'})
-    return df[['src', 'dst']].to_arrow()
+    cdf = cdf.merge(grouped_df, on=['band_id', 'band_hash'], how='inner').rename(columns={'doc_id': 'dst'})
+    return cdf[['src', 'dst']]
 
 def create_edges_from_collisions(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Create edges from a batch of candidate pairs that collide."""
@@ -86,17 +94,26 @@ def shuffle_cpu(bands_ds: ray.data.Dataset, hash_parallelism: int):
 
 
 def shuffle_gpu(bands_ds: ray.data.Dataset, hash_parallelism: int, num_gpus: int):
-    # pre-create the shuffle actors to group by band and hash
+    # pre-create the shuffle actors
+    columns = bands_ds.columns()
     actors = [
-        GPUShuffleActor.remote(nranks=num_gpus, total_nparts=hash_parallelism, shuffle_on=['band_id', 'band_hash'])
+        GPUShuffleActor.remote(
+            nranks=num_gpus,
+            hash_parallelism=hash_parallelism,
+            group_by=['band_id', 'band_hash'],
+            columns=columns,
+            map_groups_fn=create_edges_from_collisions_gpu,
+        )
         for _ in range(num_gpus)
     ]
+
+    # setup the rapidsmpf shuffle cluster
     _, root_address = ray.get(actors[0].setup_root.remote())
     ray.get([actor.setup_worker.remote(root_address) for actor in actors])
     pool = ActorPool(actors)
     logger.info(f"Actor pool setup complete")
 
-    # insert chunks into the actors
+    # insert dataset chunks into the actors
     batches = bands_ds.iter_batches(batch_size=1000*100, batch_format="pyarrow")
     batch_counts = list(pool.map(lambda actor, batch: actor.insert_batch.remote(batch), batches))
     logger.info(f"Total number of batches: {len(batch_counts)}")
@@ -107,21 +124,14 @@ def shuffle_gpu(bands_ds: ray.data.Dataset, hash_parallelism: int, num_gpus: int
     ray.get([actor.insert_finished.remote() for actor in actors])
     logger.info(f"Actor pool insert finished complete")
 
-    # read the shuffled chunks from the actors
+    # read the shuffled chunks from the actors (and apply map_groups_fn on each chunk)
     chunks = ray.get([actor.extract_partitions.remote() for actor in actors])
     logger.info(f"Number of chunks: {len(chunks)}")
     logger.info(f"Number of items in chunks: {sum([len(chunk) for chunk in chunks])}")
     logger.info(f"Actor pool read complete")
 
-    edges_list = []
-    for chunk in chunks:
-        # TODO: move into extract_partitions to avoid unnecessary data movement
-        edges = create_edges_from_collisions_gpu(chunk)
-        edges_list.append(edges)
-        # pa.parquet.write_table(edges, f"edges_chunk_{i}.parquet")
-
     # convert the list of pyarrow tables to a ray dataset
-    edges_ds = ray.data.from_arrow(edges_list)
+    edges_ds = ray.data.from_arrow(chunks)
     return edges_ds
 
 
@@ -130,7 +140,6 @@ def main(
     edges_output: str,
     hash_parallelism: int = 100,
     num_gpus: int = 0,
-    limit: int = None,
 ):
     """Shuffle the minhash bands.
 
@@ -144,12 +153,10 @@ def main(
 
     # Read the minhash checkpoint
     bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
-    if limit is not None:
-        bands_ds = bands_ds.limit(limit)
     bands_ds = bands_ds.materialize()
     logger.info(f"Number of blocks in bands_ds: {bands_ds.num_blocks()}")
 
-    # Shuffle the minhash bands using CPU object store
+    # Group by band and hash to find candidate pairs
     start = time.time()
     if num_gpus == 0:
         edges_ds = shuffle_cpu(bands_ds, hash_parallelism)
