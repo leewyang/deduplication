@@ -132,6 +132,16 @@ class GPUDataset():
         return self.dataset.materialize()
 
 
+def dataset_to_gpu(self, nranks: Optional[int] = None):
+    """Monkey-patch to convert ray.data.Dataset to GPUDataset for GPU-accelerated operations."""
+    # Prevent double-wrapping
+    if isinstance(self, GPUDataset):
+        return self
+
+    logger.debug(f"Converting Dataset to GPUDataset with nranks={nranks}")
+    return GPUDataset(self, nranks=nranks)
+
+
 def create_edges_from_collisions_gpu_block(cdf: cudf.DataFrame) -> cudf.DataFrame:
     """Create edges from a batch of candidate pairs that collide.
 
