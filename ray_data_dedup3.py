@@ -340,11 +340,12 @@ def large_star_map_groups_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
     unique_df = batch.drop_duplicates(subset=['node', 'parent'])
     mp_df = unique_df.groupby('node').agg({
         'parent': 'min',
-    }).reset_index().rename(columns={'parent': 'mp'})
+    }).reset_index()
+    mp_df.rename(columns={'parent': 'mp'}, inplace=True)
     large_neighbors = unique_df[unique_df['parent'] > unique_df['node']]
     result = large_neighbors.merge(mp_df, on='node', how='left')
-    result = result[['parent', 'mp']].rename(columns={'parent': 'node', 'mp': 'parent'})
-    return result
+    result.rename(columns={'parent': 'node', 'mp': 'parent'}, inplace=True)
+    return result[['node', 'parent']]
 
 
 def large_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -373,15 +374,16 @@ def small_star_map_groups_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
     # group by node and take the minimum parent
     mp_df = unique_df.groupby('node').agg({
         'parent': 'min',
-    }).reset_index().rename(columns={'parent': 'mp'})
+    }).reset_index()
+    mp_df.rename(columns={'parent': 'mp'}, inplace=True)
 
     # get all neighbors less than or equal to node
     small_neighbors = unique_df[unique_df['parent'] <= unique_df['node']]
 
     # merge with minimum parents and return the result
     result = small_neighbors.merge(mp_df, on='node', how='left')
-    result = result[['parent', 'mp']].rename(columns={'parent': 'node', 'mp': 'parent'})
-    return result
+    result.rename(columns={'parent': 'node', 'mp': 'parent'}, inplace=True)
+    return result[['node', 'parent']]
 
 
 def small_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -843,7 +845,7 @@ def main():
 
     args = parser.parse_args()
 
-    ray.init(num_gpus=args.num_gpus)
+    ray.init(num_gpus=args.num_gpus, _temp_dir=os.environ.get("RAY_TMP_DIR", "/tmp/ray"))
     if args.disable_progress_bars:
         ray.data.DataContext.get_current().enable_progress_bars = False
 

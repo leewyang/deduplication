@@ -1,5 +1,6 @@
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+import os
 import logging
 import time
 
@@ -29,8 +30,9 @@ class GPUShuffleActor(BulkRapidsMPFShuffler):
         hash_parallelism: int,
         group_by: list[str],
         columns: list[str],
+        **kwargs: Any,
     ):
-        super().__init__(nranks=nranks, total_nparts=hash_parallelism, shuffle_on=group_by)
+        super().__init__(nranks=nranks, total_nparts=hash_parallelism, shuffle_on=group_by, **kwargs)
         self.columns = columns
         self.group_by = group_by
         logger.info(f"Rank {self.rank} setup complete")
@@ -83,6 +85,7 @@ class GPUDataset():
                 hash_parallelism=self.num_partitions,
                 group_by=self.key,
                 columns=self.dataset.columns(),
+                rmm_pool_size=None,  # 50% of free GPU memory
             )
             for _ in range(self.nranks)
         ]
@@ -150,10 +153,12 @@ def create_edges_from_collisions_gpu_block(cdf: cudf.DataFrame) -> cudf.DataFram
     grouped_df = (
         cdf.groupby(['band_id', 'band_hash'])
         .agg({'doc_id': 'min', 'count': 'sum'})
-        .reset_index().rename(columns={'doc_id': 'src', 'count': 'count'})
+        .reset_index()
     )
+    grouped_df.rename(columns={'doc_id': 'src', 'count': 'count'}, inplace=True)  # rename in place to avoid copy
     grouped_df = grouped_df.loc[grouped_df['count'] > 1]
-    cdf = cdf.merge(grouped_df, on=['band_id', 'band_hash'], how='inner').rename(columns={'doc_id': 'dst'})
+    cdf = cdf.merge(grouped_df, on=['band_id', 'band_hash'], how='inner')
+    cdf.rename(columns={'doc_id': 'dst'}, inplace=True)  # rename in place to avoid copy
     return cdf[['src', 'dst']]
 
 
@@ -228,7 +233,7 @@ def main(
     Returns:
         edges_ds: Dataset of edges.
     """
-    ray.init(num_gpus=num_gpus)
+    ray.init(num_gpus=num_gpus, _temp_dir=os.environ.get("RAY_TMP_DIR", "/tmp"))
 
     # Read the minhash checkpoint
     bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
