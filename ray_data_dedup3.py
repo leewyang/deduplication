@@ -343,7 +343,7 @@ def large_star_map_groups_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
     }).reset_index()
     mp_df.rename(columns={'parent': 'mp'}, inplace=True)
     large_neighbors = unique_df[unique_df['parent'] > unique_df['node']]
-    result = large_neighbors.merge(mp_df, on='node', how='left')
+    result = large_neighbors.merge(mp_df, on='node', how='left').drop(columns=['node'])
     result.rename(columns={'parent': 'node', 'mp': 'parent'}, inplace=True)
     return result[['node', 'parent']]
 
@@ -381,7 +381,7 @@ def small_star_map_groups_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
     small_neighbors = unique_df[unique_df['parent'] <= unique_df['node']]
 
     # merge with minimum parents and return the result
-    result = small_neighbors.merge(mp_df, on='node', how='left')
+    result = small_neighbors.merge(mp_df, on='node', how='left').drop(columns=['node'])
     result.rename(columns={'parent': 'node', 'mp': 'parent'}, inplace=True)
     return result[['node', 'parent']]
 
@@ -901,12 +901,22 @@ def main():
         logger.info("No duplicates found, skipping join.")
         deduplicated_ds = ds
     else:
-        deduplicated_ds = ds.join(
-            duplicate_components,
-            on=(args.id_column,),
-            right_on=('node',),
-            join_type='left_anti',
-            num_partitions=args.parallelism)
+        if args.num_gpus > 0:
+            logger.info("Joining with original dataset using GPU...")
+            deduplicated_ds = ds.gpu(nranks=args.num_gpus).join(
+                duplicate_components,
+                on=(args.id_column,),
+                right_on=('node',),
+                join_type='left_anti',
+                num_partitions=args.parallelism)
+        else:
+            logger.info("Joining with original dataset using CPU...")
+            deduplicated_ds = ds.join(
+                duplicate_components,
+                on=(args.id_column,),
+                right_on=('node',),
+                join_type='left_anti',
+                num_partitions=args.parallelism)
     deduplicated_ds = deduplicated_ds.materialize()
     join_end_time = time.time()
     logger.info("Step 8 time: %s seconds", join_end_time - join_start_time)

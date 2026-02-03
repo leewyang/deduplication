@@ -23,6 +23,223 @@ logger = logging.getLogger(__name__)
 
 
 @ray.remote(num_gpus=1)
+class GPUJoinActor(BulkRapidsMPFShuffler):
+    """GPU actor for sort-merge join operations using two-phase shuffle.
+
+    Phase 1: Shuffle right dataset by right_keys, extract and store partitions
+    Phase 2: Shuffle left dataset by left_keys, join with stored right partitions
+
+    This ensures both datasets are properly hash-partitioned by their join keys,
+    avoiding memory issues with large right datasets.
+    """
+
+    def __init__(
+        self,
+        nranks: int,
+        hash_parallelism: int,
+        left_keys: List[str],
+        right_keys: List[str],
+        left_columns: List[str],
+        right_columns: List[str],
+        join_type: str,
+    ):
+        """Initialize GPU join actor.
+
+        Args:
+            nranks: Total number of GPU actors
+            hash_parallelism: Number of partitions for hash-based shuffle
+            left_keys: Join keys for left dataset
+            right_keys: Join keys for right dataset
+            left_columns: All columns in left dataset
+            right_columns: All columns in right dataset
+            join_type: Type of join ('inner', 'left', 'left_anti')
+        """
+        # Initialize with RIGHT keys for Phase 1 shuffle
+        super().__init__(nranks=nranks, total_nparts=hash_parallelism, shuffle_on=right_keys)
+
+        self.left_keys = left_keys
+        self.right_keys = right_keys
+        self.left_columns = left_columns
+        self.right_columns = right_columns
+        self.join_type = join_type
+        self.hash_parallelism = hash_parallelism
+
+        # Storage for shuffled right dataset partitions (cuDF DataFrames)
+        self.stored_right_partitions = []
+        self.phase = 'right'  # Track current phase: 'right' or 'left'
+
+        logger.info(f"GPU join actor initialized in Phase 1 (right shuffle) mode")
+
+    def insert_right_batch(self, batch: pa.Table) -> int:
+        """Phase 1: Insert right batch into RAPIDS MPF shuffler."""
+        if self.phase != 'right':
+            raise RuntimeError(f"Cannot insert right batch in phase '{self.phase}'")
+        df = cudf.DataFrame.from_arrow(batch)
+        self.insert_chunk(table=df, column_names=self.right_columns)
+        return len(batch)
+
+    def right_insert_finished(self):
+        """Phase 1: Complete right shuffle, extract and store partitions."""
+        if self.phase != 'right':
+            raise RuntimeError(f"Cannot finish right insert in phase '{self.phase}'")
+
+        rank = self.rank()
+        logger.info(f"Rank {rank}: Finishing right dataset shuffle...")
+
+        # Mark insertion as finished
+        self.insert_finished()
+
+        # Extract and store shuffled right partitions
+        logger.info(f"Rank {rank}: Extracting right partitions...")
+        for partition_id, partition in self.extract():
+            cdf = pylibcudf_to_cudf_dataframe(partition, self.right_columns)
+            self.stored_right_partitions.append(cdf)
+            logger.info(f"Rank {rank}: Stored right partition {partition_id} with {len(cdf)} rows")
+
+        total_right_rows = sum(len(cdf) for cdf in self.stored_right_partitions)
+        logger.info(f"Rank {rank}: Phase 1 complete - stored {len(self.stored_right_partitions)} partitions, {total_right_rows} total rows")
+
+        # Reset for Phase 2 (left dataset shuffle)
+        self._reset_for_left_shuffle()
+
+    def _reset_for_left_shuffle(self):
+        """Create new shuffler for Phase 2 (left dataset)."""
+        rank = self.rank()
+        logger.info(f"Rank {rank}: Resetting shuffler for Phase 2 (left shuffle)...")
+
+        # Update shuffle keys to left_keys
+        self.shuffle_on = self.left_keys
+
+        # Create new shuffler instance (reuses existing buffer resources and comm)
+        self.shuffler = self.create_shuffler(
+            0,
+            total_num_partitions=self.hash_parallelism,
+            buffer_resource=self.br,
+            statistics=self.stats,
+        )
+
+        self.phase = 'left'
+        logger.info(f"Rank {rank}: Phase 2 initialized (left shuffle mode)")
+
+    def insert_left_batch(self, batch: pa.Table) -> int:
+        """Phase 2: Insert left batch into RAPIDS MPF shuffler."""
+        if self.phase != 'left':
+            raise RuntimeError(f"Cannot insert left batch in phase '{self.phase}'. Must finish right shuffle first.")
+        df = cudf.DataFrame.from_arrow(batch)
+        self.insert_chunk(table=df, column_names=self.left_columns)
+        return len(batch)
+
+    def left_insert_finished(self):
+        """Phase 2: Mark left dataset insert as finished."""
+        if self.phase != 'left':
+            raise RuntimeError(f"Cannot finish left insert in phase '{self.phase}'")
+        self.insert_finished()
+        logger.info(f"Rank {self.rank()}: Left dataset insert finished")
+
+    def execute_join(self) -> pa.Table:
+        """Phase 3: Extract left partitions and join with stored right partitions.
+
+        Returns:
+            PyArrow table with join results
+        """
+        if self.phase != 'left':
+            raise RuntimeError(f"Cannot execute join in phase '{self.phase}'. Must complete both shuffles first.")
+
+        rank = self.rank()
+        logger.info(f"Rank {rank}: Phase 3 - Executing join...")
+
+        # Prepare right dataset (already shuffled and stored)
+        if len(self.stored_right_partitions) > 0:
+            logger.info(f"Rank {rank}: Concatenating {len(self.stored_right_partitions)} stored right partitions...")
+            right_cdf = cudf.concat(self.stored_right_partitions)
+            logger.info(f"Rank {rank}: Right partition size: {len(right_cdf)} rows")
+
+            # Sort right by join keys
+            logger.info(f"Rank {rank}: Sorting right partition by {self.right_keys}...")
+            right_cdf = right_cdf.sort_values(by=self.right_keys)
+        else:
+            logger.info(f"Rank {rank}: No right partitions stored")
+            right_cdf = None
+
+        # Extract and process left partitions
+        result_parts = []
+        logger.info(f"Rank {rank}: Extracting and joining left partitions...")
+
+        for partition_id, left_partition in self.extract():
+            # Convert to cuDF
+            left_cdf = pylibcudf_to_cudf_dataframe(left_partition, self.left_columns)
+            logger.info(f"Rank {rank}: Processing left partition {partition_id} with {len(left_cdf)} rows")
+
+            if len(left_cdf) == 0:
+                continue
+
+            # Sort left by join keys
+            left_cdf = left_cdf.sort_values(by=self.left_keys)
+
+            # Perform join
+            if right_cdf is not None and len(right_cdf) > 0:
+                result = self._merge_join(left_cdf, right_cdf)
+            else:
+                # Handle empty right dataset based on join type
+                if self.join_type in ('left', 'left_anti'):
+                    result = left_cdf
+                else:  # inner join
+                    result = cudf.DataFrame({col: [] for col in self.left_columns})
+
+            if len(result) > 0:
+                result_parts.append(result)
+
+        # Combine all result parts
+        if len(result_parts) == 0:
+            logger.info(f"Rank {rank}: No matching rows found, returning empty result")
+            return pa.table({col: [] for col in self.left_columns})
+
+        logger.info(f"Rank {rank}: Concatenating {len(result_parts)} result parts...")
+        final_result = cudf.concat(result_parts)
+        logger.info(f"Rank {rank}: Join complete, final result size: {len(final_result)} rows")
+
+        return final_result.to_arrow(preserve_index=False)
+
+    def _merge_join(self, left_cdf: cudf.DataFrame, right_cdf: cudf.DataFrame) -> cudf.DataFrame:
+        """Perform sort-merge join on sorted DataFrames.
+
+        Args:
+            left_cdf: Sorted left DataFrame
+            right_cdf: Sorted right DataFrame
+
+        Returns:
+            Joined DataFrame
+        """
+        if self.join_type in ['inner', 'left']:
+            result = left_cdf.merge(
+                right_cdf,
+                left_on=self.left_keys,
+                right_on=self.right_keys,
+                how=self.join_type,
+            )
+        elif self.join_type == 'left_anti':
+            # cuDF doesn't support indicator parameter, so implement anti join manually
+            # Add a marker column to right dataset
+            right_cdf_marked = right_cdf.copy()
+            right_cdf_marked['__right_marker__'] = 1
+
+            # Perform left join
+            temp = left_cdf.merge(
+                right_cdf_marked[[*self.right_keys, '__right_marker__']],
+                left_on=self.left_keys,
+                right_on=self.right_keys,
+                how='left',
+            )
+
+            # Keep only rows where marker is null (no match in right)
+            result = temp[temp['__right_marker__'].isna()][self.left_columns]
+        else:
+            raise ValueError(f"Unsupported join type: {self.join_type}")
+
+        return result
+
+
+@ray.remote(num_gpus=1)
 class GPUShuffleActor(BulkRapidsMPFShuffler):
     def __init__(
         self,
@@ -133,6 +350,62 @@ class GPUDataset():
 
     def materialize(self) -> ray.data.Dataset:
         return self.dataset.materialize()
+
+    def join(
+        self,
+        right_ds,
+        on,
+        right_on=None,
+        join_type='inner',
+        num_partitions=None,
+    ) -> "GPUDataset":
+        """GPU-accelerated join implementation.
+
+        Args:
+            right_ds: Right dataset to join (can be Dataset or GPUDataset)
+            on: Join key(s) for left dataset (string or list of strings)
+            right_on: Join key(s) for right dataset (default: same as on)
+            how: Join type - 'inner', 'left', or 'left_anti'
+            num_partitions: Number of partitions for shuffle (default: nranks)
+
+        Returns:
+            GPUDataset wrapping the join result
+
+        Example:
+            result = left_ds.gpu(nranks=4).join(
+                right_ds, on='id', how='inner'
+            ).materialize()
+        """
+        from gpu_join import GPUJoinExecutor
+
+        # Extract underlying Dataset if right_ds is GPUDataset
+        if hasattr(right_ds, 'dataset'):
+            right_ds = right_ds.dataset
+
+        # Handle tuple format (for compatibility with Ray Data API)
+        if isinstance(on, tuple):
+            on = list(on)
+        if isinstance(right_on, tuple):
+            right_on = list(right_on)
+
+        # Normalize parameters as lists
+        on_list = on if isinstance(on, list) else [on]
+        right_on_list = right_on if right_on else on_list
+        right_on_list = right_on_list if isinstance(right_on_list, list) else [right_on_list]
+
+        # Execute join
+        executor = GPUJoinExecutor(
+            left_ds=self.dataset,
+            right_ds=right_ds,
+            nranks=self.nranks,
+            on=on_list,
+            right_on=right_on_list,
+            join_type=join_type,
+            num_partitions=num_partitions or self.nranks,
+        )
+
+        result_ds = executor.execute()
+        return GPUDataset(result_ds, nranks=self.nranks)
 
 
 def dataset_to_gpu(self, nranks: Optional[int] = None):
