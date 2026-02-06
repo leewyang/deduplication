@@ -27,6 +27,7 @@ import pandas as pd
 import ray
 from scipy import integrate
 
+import dataset_extensions  # noqa: F401, monkey-patch ray.data.Dataset
 from minhash_gpu import GPUMinHash
 from shuffle_gpu import create_edges_from_collisions_gpu_block, dataset_to_gpu
 from util import check_path_exists, list_parquet_files
@@ -37,10 +38,6 @@ logger = logging.getLogger(__name__)
 # Constants
 MERSENNE_PRIME = np.uint64((1 << 61) - 1)
 MAX_HASH = np.uint32((1 << 32) - 1)
-
-# Monkey-patch ray.data.Dataset.gpu() to convert to GPUDataset
-# TODO: figure out a way to do this without monkey-patching
-ray.data.Dataset.gpu = dataset_to_gpu
 
 
 def sha1_hash32(data: bytes) -> int:
