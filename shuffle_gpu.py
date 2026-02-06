@@ -269,9 +269,10 @@ class GPUShuffleActor(BulkRapidsMPFShuffler):
         partitions = []
         for _, partition in self.extract():
             partitions.append(partition)
+
         # TODO: can this be done in a streaming manner?
         cdfs = [pylibcudf_to_cudf_dataframe(partition, self.columns) for partition in partitions]
-        cdf = cudf.concat(cdfs)
+        cdf = cudf.concat(cdfs) if len(cdfs) > 0 else cudf.DataFrame({col: [] for col in self.columns})
 
         # apply the map_groups_fn, if provided
         if map_groups_fn:
@@ -292,7 +293,7 @@ class GPUDataset():
         self.nranks = nranks
 
     def groupby(self, key: Union[str, List[str], None], num_partitions: Optional[int] = None) -> "GPUDataset":
-        self.key = key
+        self.key = key if isinstance(key, list) else [key]
         self.num_partitions = num_partitions if num_partitions else self.nranks
 
         # create the shuffle actors
