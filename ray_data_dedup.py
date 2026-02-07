@@ -18,6 +18,7 @@ import hashlib
 import logging
 import os
 import struct
+import time
 
 import cudf
 import numpy as np
@@ -26,8 +27,10 @@ import pandas as pd
 import ray
 from scipy import integrate
 
+import gpu_dataset  # noqa: F401, monkey-patch ray.data.Dataset
 from minhash_gpu import GPUMinHash
-from util import list_parquet_files
+from shuffle_gpu import create_edges_from_collisions_gpu_block
+from util import check_path_exists, list_parquet_files
 
 
 logger = logging.getLogger(__name__)
@@ -142,6 +145,21 @@ class MinHashGenerator:
         return phv.min(axis=0)
 
 
+def generate_minhash_signatures_gpu(
+    batch: Dict[str, np.ndarray],
+    text_column: str,
+    num_perm: int,
+    ngram_size: int,
+    seed: int,
+) -> Dict[str, np.ndarray]:
+    """Generate MinHash signatures for a batch of documents using GPU."""
+    generator = GPUMinHash(seed=seed, num_hashes=num_perm, char_ngrams=ngram_size)
+    texts = batch[text_column]
+    signatures = generator.compute_minhashes(cudf.Series(texts, dtype='str').str.lower())
+    batch['minhash'] = signatures.list.leaves.values.get().reshape(-1, num_perm)
+    return batch
+
+
 def generate_minhash_signatures(
     batch: Dict[str, np.ndarray],
     text_column: str,
@@ -239,14 +257,50 @@ def create_edges_from_collisions(batch: Dict[str, np.ndarray]) -> Dict[str, np.n
     return {'src': src, 'dst': dst}
 
 
-def distinct_2col(current_ds: ray.data.Dataset, col_1, col_2, parallelism: int = 100) -> ray.data.Dataset:
-    def distinct_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        unique_values = np.unique(batch[col_2])
-        return {col_1: np.repeat(batch[col_1][0], len(unique_values)), col_2: unique_values}
-    current_ds = current_ds.select_columns([col_1, col_2])
-    current_ds = current_ds.groupby(col_1, num_partitions=parallelism).map_groups(distinct_map_groups, batch_format="numpy")
-    current_ds = current_ds.materialize()
+def distinct_2col(
+    current_ds: ray.data.Dataset,
+    col_1,
+    col_2,
+    parallelism: int = 100,
+    num_gpus: int = 0,
+) -> ray.data.Dataset:
+    if num_gpus > 0:
+        logger.info("distinct_2col using GPU...")
+        def distinct_map_groups_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
+            unique_df = batch.drop_duplicates(subset=[col_1, col_2])
+            return unique_df
+        current_ds = (
+            current_ds.gpu(nranks=num_gpus).groupby([col_1, col_2], num_partitions=int(parallelism/10))
+            .map_groups(distinct_map_groups_gpu, fn_type="block")
+            .materialize()
+        )
+    else:
+        logger.info("distinct_2col using CPU...")
+        def distinct_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+            unique_values = np.unique(batch[col_2])
+            return {col_1: np.repeat(batch[col_1][0], len(unique_values)), col_2: unique_values}
+        current_ds = current_ds.select_columns([col_1, col_2])
+        current_ds = current_ds.groupby(col_1, num_partitions=parallelism).map_groups(distinct_map_groups, batch_format="numpy")
+        current_ds = current_ds.materialize()
     return current_ds
+
+
+def large_star_emit_gpu(batch: pa.Table) -> pa.Table:
+    """Vectorized implementation of large_star_emit using GPU."""
+    cdf = cudf.DataFrame.from_arrow(batch)
+
+    # non-identity pairs
+    non_identity_pairs = cdf[cdf['node'] != cdf['parent']]
+
+    # reverse the non-identity pairs
+    reversed_non_identity_pairs = cudf.DataFrame({
+        'node': non_identity_pairs['parent'],
+        'parent': non_identity_pairs['node'],
+    })
+
+    # concatenate the identity pairs and the reversed non-identity pairs
+    result = cudf.concat([cdf, reversed_non_identity_pairs])
+    return result.to_arrow(preserve_index=False)
 
 
 def large_star_emit(row):
@@ -255,6 +309,20 @@ def large_star_emit(row):
         return [{"node": u, "parent": v}]
     return [{"node": u, "parent": v}, {"node": v, "parent": u}]
 
+
+def small_star_emit_gpu(batch: pa.Table) -> pa.Table:
+    """Vectorized implementation of small_star_emit using GPU."""
+    cdf = cudf.DataFrame.from_arrow(batch)
+    node_greater = cdf[cdf['node'] >= cdf['parent']]
+    node_lesser = cdf[cdf['node'] < cdf['parent']]
+    node_lesser_reversed = cudf.DataFrame({
+        'node': node_lesser['parent'],
+        'parent': node_lesser['node'],
+    })
+    result = cudf.concat([node_greater, node_lesser_reversed])
+    return result.to_arrow(preserve_index=False)
+
+
 def small_star_emit(row):
     """Emit (u, v) if u >= v else (v, u) -> (node, parent)"""
     u, v = row["node"], row["parent"]
@@ -262,6 +330,19 @@ def small_star_emit(row):
         return [{"node": u, "parent": v}]
     else:
         return [{"node": v, "parent": u}]
+
+
+def large_star_map_groups_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
+    """Map groups for large-star using GPU."""
+    unique_df = batch.drop_duplicates(subset=['node', 'parent'])
+    mp_df = unique_df.groupby('node').agg({
+        'parent': 'min',
+    }).reset_index()
+    mp_df.rename(columns={'parent': 'mp'}, inplace=True)
+    large_neighbors = unique_df[unique_df['parent'] > unique_df['node']]
+    result = large_neighbors.merge(mp_df, on='node', how='left').drop(columns=['node'])
+    result.rename(columns={'parent': 'node', 'mp': 'parent'}, inplace=True)
+    return result[['node', 'parent']]
 
 
 def large_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -276,6 +357,32 @@ def large_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]
     large_neighbors = neighbors[neighbors > node]
     return {'node': large_neighbors, 'parent': np.repeat(mp, len(large_neighbors))}
 
+
+def small_star_map_groups_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
+    """Map groups for small-star using GPU."""
+    unique_df = batch.drop_duplicates(subset=['node', 'parent'])
+
+    # ensure identity neighbor for each node
+    identity_nodes = unique_df.loc[unique_df['node'] == unique_df['parent']]['node']
+    non_identity_df = unique_df.loc[~unique_df['node'].isin(identity_nodes)][['node']].copy()
+    non_identity_df['parent'] = non_identity_df['node']
+    unique_df = cudf.concat([non_identity_df, unique_df])
+
+    # group by node and take the minimum parent
+    mp_df = unique_df.groupby('node').agg({
+        'parent': 'min',
+    }).reset_index()
+    mp_df.rename(columns={'parent': 'mp'}, inplace=True)
+
+    # get all neighbors less than or equal to node
+    small_neighbors = unique_df[unique_df['parent'] <= unique_df['node']]
+
+    # merge with minimum parents and return the result
+    result = small_neighbors.merge(mp_df, on='node', how='left').drop(columns=['node'])
+    result.rename(columns={'parent': 'node', 'mp': 'parent'}, inplace=True)
+    return result[['node', 'parent']]
+
+
 def small_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Map groups for small-star.
 
@@ -289,6 +396,7 @@ def small_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]
     mp = min(small_neighbors)
     return {'node': small_neighbors, 'parent': np.repeat(mp, len(small_neighbors))}
 
+
 def cast_node_parent_large_string(batch: pa.Table) -> pa.Table:
     """Cast node and parent to large string."""
     new_schema = pa.schema([
@@ -297,11 +405,13 @@ def cast_node_parent_large_string(batch: pa.Table) -> pa.Table:
     ])
     return batch.select(['node', 'parent']).cast(new_schema)
 
+
 def compute_connected_components_distributed(
     current_ds: ray.data.Dataset,
     max_iterations: int = 100,
     parallelism: int = 200,
-    verbose=False
+    verbose=False,
+    num_gpus: int = 0,
 ) -> ray.data.Dataset:
     """
     Compute connected components using distributed large-star/small-star algorithm.
@@ -327,33 +437,76 @@ def compute_connected_components_distributed(
 
     current_ds = current_ds.materialize()
     num_components = current_ds.count()
-    print(f"Initial count: {num_components}")
+    logger.info("Initial count: %s", num_components)
     convergence_counter = 3
     for i in range(max_iterations):
         current_ds = current_ds.map_batches(cast_node_parent_large_string, batch_format="pyarrow")
         current_ds = current_ds.materialize()
         # Step 1: Large-star
-        current_ds = current_ds.flat_map(large_star_emit, memory=8*2**30)
-        current_ds = current_ds\
-            .groupby(['node'], num_partitions=parallelism)\
-            .map_groups(large_star_map_groups, batch_format="numpy")
-        current_ds = current_ds.materialize()
+        if num_gpus > 0:
+            # GPU
+            current_ds = current_ds.map_batches(
+                large_star_emit_gpu,
+                batch_format="pyarrow",
+                num_gpus=1,
+                batch_size=1000*100,
+            )
+            current_ds = current_ds.materialize()  # TODO: figure out a way to keep everything on GPU
+            logger.info("Length of large_star_emit_gpu: %s", current_ds.count())
+            current_ds = (
+                current_ds.gpu(nranks=num_gpus)
+                .groupby(['node'], num_partitions=int(parallelism/10))
+                .map_groups(large_star_map_groups_gpu)
+                .materialize()
+            )
+            logger.info("Length of large_star_map_groups_gpu: %s", current_ds.count())
+        else:
+            # CPU
+            current_ds = current_ds.flat_map(large_star_emit, memory=8*2**30).materialize()
+            logger.info("Length of large_star_emit: %s", current_ds.count())
+            current_ds = current_ds\
+                .groupby(['node'], num_partitions=parallelism)\
+                .map_groups(large_star_map_groups, batch_format="numpy")\
+                .materialize()
+            logger.info("Length of large_star_map_groups: %s", current_ds.count())
         # current_ds = distinct(current_ds, ['node', 'parent'])
         # current_ds = current_ds.materialize()
         if verbose:
             print(current_ds.to_pandas())
 
         # Step 2: Small-star
-        current_ds = current_ds.flat_map(small_star_emit)
-        current_ds = current_ds\
-            .groupby(['node'], num_partitions=parallelism)\
-            .map_groups(small_star_map_groups, batch_format="numpy")
+        if num_gpus > 0:
+            # GPU
+            current_ds = current_ds.map_batches(
+                small_star_emit_gpu,
+                batch_format="pyarrow",
+                num_gpus=1,
+                batch_size=1000*100,
+            )
+            current_ds = current_ds.materialize()  # TODO: figure out a way to keep everything on GPU
+            logger.info("Length of small_star_emit_gpu: %s", current_ds.count())
+            current_ds = (
+                current_ds.gpu(nranks=num_gpus)
+                .groupby(['node'], num_partitions=int(parallelism/10))
+                .map_groups(small_star_map_groups_gpu)
+                .materialize()
+            )
+            logger.info("Length of small_star_map_groups_gpu: %s", current_ds.count())
+        else:
+            # CPU
+            current_ds = current_ds.flat_map(small_star_emit).materialize()
+            logger.info("Length of small_star_emit: %s", current_ds.count())
+            current_ds = current_ds\
+                .groupby(['node'], num_partitions=parallelism)\
+                .map_groups(small_star_map_groups, batch_format="numpy")\
+                .materialize()
+            logger.info("Length of small_star_map_groups: %s", current_ds.count())
 
-        current_ds = current_ds.materialize()
         # current_ds = distinct(current_ds, ['node', 'parent'])
         # current_ds = current_ds.materialize()
         # TODO - refactor this to be distributed
         new_num_components = current_ds.groupby("parent").count().count()
+        logger.info("Number of new components: %s", new_num_components)
 
         if num_components == new_num_components:
             convergence_counter -= 1
@@ -382,17 +535,19 @@ def get_or_create_minhash_bands(
         ngram_size: int,
         seed: int,
         output_blocks: int = 100,
-        use_gpu: bool = False,
-        gpu_batch_size: int = 1,
+        num_gpus: int = 0,
+        gpu_batch_size: int = 1000*100,
         num_gpus_per_task: float = 1.0) -> ray.data.Dataset:
 
-    # if minhash_checkpoint_uri is not None:
-    #     if not check_path_exists(minhash_checkpoint_uri):
-    #         raise ValueError(f"Checkpoint URI {minhash_checkpoint_uri} does not exist")
-    #     bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
-    #     bands_ds = bands_ds.repartition(num_blocks=output_blocks)
-    #     bands_ds = bands_ds.materialize()
-    #     return bands_ds
+    if minhash_checkpoint_uri is not None:
+        if check_path_exists(minhash_checkpoint_uri):
+            logger.info("Reading minhash bands from checkpoint: %s", minhash_checkpoint_uri)
+            bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
+            bands_ds = bands_ds.repartition(num_blocks=output_blocks)
+            bands_ds = bands_ds.materialize()
+            return bands_ds
+
+    logger.info("Generating minhash bands")
 
     # Need to materialize first if limiting, or else the limit could be non-deterministic
     ds = ds.materialize()
@@ -401,34 +556,22 @@ def get_or_create_minhash_bands(
 
     # Compute optimal LSH parameters
     num_bands, rows_per_band = optimal_param(threshold, num_perm)
-    logger.info(f"LSH parameters: {num_bands} bands, {rows_per_band} rows per band")
+    logger.info("LSH parameters: %s bands, %s rows per band", num_bands, rows_per_band)
 
     # Step 1: Generate MinHash signatures
     logger.info("Step 1: Generating MinHash signatures...")
-    if use_gpu:
-        generator = GPUMinHash(seed=seed, num_hashes=num_perm, char_ngrams=ngram_size)
-        def minhash_gpu_fused(x):
-            files = x["filename"]
-            id_list = []
-            minhash_list = []
-            for file in files:
-                df = cudf.read_parquet(file)
-                id_series = df["id"]
-                text_series = df["text"].str.lower()
-                minhashes = generator.compute_minhashes(text_series)
-                minhash_list.append(minhashes)
-                id_list.append(id_series)
-            ids = cudf.concat(id_list).to_numpy()
-            minhashes = cudf.concat(minhash_list)
-            return {
-                "id": ids,
-                "minhash": minhashes.list.leaves.values.get().reshape(-1, num_perm),
-            }
-
+    generate_minhash_start_time = time.time()
+    if num_gpus > 0:
         ds_with_minhash = ds.map_batches(
-            minhash_gpu_fused,
+            generate_minhash_signatures_gpu,
+            fn_kwargs={
+                'text_column': text_column,
+                'num_perm': num_perm,
+                'ngram_size': ngram_size,
+                'seed': seed,
+            },
             batch_format='numpy',
-            batch_size=1,
+            batch_size=gpu_batch_size,
             num_gpus=num_gpus_per_task,
         )
     else:
@@ -443,12 +586,14 @@ def get_or_create_minhash_bands(
             },
             batch_format='numpy',
         )
-
     ds_with_minhash = ds_with_minhash.materialize()
+    generate_minhash_end_time = time.time()
+    logger.info("Step 1 time: %s seconds", generate_minhash_end_time - generate_minhash_start_time)
 
     # Step 2: Generate LSH bands (creates multiple rows per document)
     logger.info("Step 2: Generating LSH bands...")
     # Schema: ['doc_id', 'band_id', 'band_hash'], non are unique
+    generate_lsh_bands_start_time = time.time()
     bands_ds: ray.data.Dataset = ds_with_minhash.map_batches(
         generate_lsh_bands,
         fn_kwargs={
@@ -460,6 +605,8 @@ def get_or_create_minhash_bands(
     bands_ds = bands_ds.materialize()
     bands_ds = bands_ds.repartition(num_blocks=output_blocks)
     bands_ds = bands_ds.materialize()
+    generate_lsh_bands_end_time = time.time()
+    logger.info("Step 2 time: %s seconds", generate_lsh_bands_end_time - generate_lsh_bands_start_time)
 
     if minhash_checkpoint_uri is not None:
         bands_ds.write_parquet(minhash_checkpoint_uri)
@@ -471,6 +618,8 @@ def find_duplicate_components(
     max_cc_iterations: int = 100,
     validate_local: bool = False,
     hash_parallelism: int = 100,
+    num_gpus: int = 0,
+    edges_checkpoint_uri: Optional[str] = None,
 ) -> ray.data.Dataset:
     """
     Find duplicate components in a dataset of bands/hashes.
@@ -485,14 +634,38 @@ def find_duplicate_components(
         Deduplicated dataset
     """
     bands_ds = bands_ds.materialize()
-    print("Number of blocks in bands_ds", bands_ds.num_blocks())
+
     # Step 3: Group by band to find candidate pairs
-    logger.info("Step 3: Grouping by bands to find candidate pairs...")
-    edges_ds = bands_ds.groupby(
-        ['band_id', 'band_hash'], num_partitions=hash_parallelism).map_groups(create_edges_from_collisions, batch_format="numpy")
-    edges_ds = edges_ds.materialize()
+    create_edges_start_time = time.time()
+    if edges_checkpoint_uri is not None and check_path_exists(edges_checkpoint_uri):
+        logger.info("Reading edges from checkpoint: %s", edges_checkpoint_uri)
+        edges_ds = ray.data.read_parquet(edges_checkpoint_uri)
+        edges_ds = edges_ds.materialize()
+    else:
+        logger.info("Generating edges")
+        logger.info("Number of blocks in bands_ds: %s", bands_ds.num_blocks())
+        if num_gpus > 0:
+            logger.info("Step 3: Grouping by bands to find candidate pairs using GPU...")
+            edges_ds = (
+                bands_ds.gpu(nranks=num_gpus)
+                .groupby(['band_id', 'band_hash'], num_partitions=int(hash_parallelism/10))
+                .map_groups(create_edges_from_collisions_gpu_block, fn_type="block")
+                .materialize()
+            )
+        else:
+            logger.info("Step 3: Grouping by bands to find candidate pairs using CPU...")
+            edges_ds = (
+                bands_ds.groupby(['band_id', 'band_hash'], num_partitions=hash_parallelism)
+                .map_groups(create_edges_from_collisions, batch_format="numpy")
+                .materialize()
+            )
+        if edges_checkpoint_uri:
+            edges_ds.write_parquet(edges_checkpoint_uri)
+
     edges_count = edges_ds.count()
-    print("Length of edges_ds", edges_count)
+    create_edges_end_time = time.time()
+    logger.info("Length of edges_ds: %s", edges_count)
+    logger.info("Step 3 time: %s seconds", create_edges_end_time - create_edges_start_time)
 
     # Handle empty edges case (no collisions found)
     if edges_count == 0:
@@ -506,20 +679,27 @@ def find_duplicate_components(
     # Use groupby to deduplicate across all batches
     # Group by (src, dst) and keep just one of each unique edge
 
+    distinct_2col_start_time = time.time()
     edges_ds = distinct_2col(
-        edges_ds, col_1='src', col_2='dst', parallelism=hash_parallelism)
-    print("Length of edges_ds after distinct", edges_ds.count())
+        edges_ds, col_1='src', col_2='dst', parallelism=hash_parallelism, num_gpus=num_gpus
+    )
+    distinct_2col_end_time = time.time()
+    logger.info("Length of edges_ds after distinct: %s", edges_ds.count())
+    logger.info("Step 4 time: %s seconds", distinct_2col_end_time - distinct_2col_start_time)
 
     # Step 6: Compute connected components (distributed algorithm)
     logger.info("Step 6: Computing connected components (distributed)...")
-    edges_ds = edges_ds.rename_columns(
-        {"src": "node", "dst": "parent"}
-    ).materialize()
+    connected_components_start_time = time.time()
+    edges_ds = edges_ds.rename_columns({"src": "node", "dst": "parent"}).materialize()
     components_ds = compute_connected_components_distributed(
         edges_ds,
         max_iterations=max_cc_iterations,
         parallelism=hash_parallelism,
+        num_gpus=num_gpus,
     )
+    logger.info("Length of components_ds: %s", components_ds.count())
+    connected_components_end_time = time.time()
+    logger.info("Step 6 time: %s seconds", connected_components_end_time - connected_components_start_time)
 
     # check local version
     if validate_local:
@@ -529,11 +709,25 @@ def find_duplicate_components(
     logger.info("Step 7: Filtering duplicates...")
 
     # Keep only documents where node != parent (extraneous components)
-    duplicate_components = components_ds.filter(
-        lambda row: row['node'] != row['parent']
-    ).materialize()
-
-    logger.info(f"Duplicated components count: {duplicate_components.count()}")
+    filter_duplicates_start_time = time.time()
+    if num_gpus > 0:
+        def filter_gpu(batch: pa.Table) -> pa.Table:
+            cdf = cudf.DataFrame.from_arrow(batch)
+            cdf = cdf[cdf['node'] != cdf['parent']]
+            return cdf.to_arrow(preserve_index=False)
+        duplicate_components = components_ds.map_batches(
+            filter_gpu,
+            batch_format="pyarrow",
+            num_gpus=1,
+            batch_size=1000*100,
+        ).materialize()
+    else:
+        duplicate_components = components_ds.filter(
+            lambda row: row['node'] != row['parent']
+        ).materialize()
+    filter_duplicates_end_time = time.time()
+    logger.info("Duplicated components count: %s", duplicate_components.count())
+    logger.info("Step 7 time: %s seconds", filter_duplicates_end_time - filter_duplicates_start_time)
     return duplicate_components
 
 
@@ -611,33 +805,22 @@ def main():
         default=1000
     )
     parser.add_argument(
-        "--minhash-checkpoint-uri",
-        type=str,
-        help="Checkpoint URI for minhash bands",
-    )
-    parser.add_argument(
         "--disable-progress-bars",
         action="store_true",
         default=False,
         help="Disable progress bars",
     )
     parser.add_argument(
-        "--use-gpu",
-        action="store_true",
-        default=False,
-        help="Use GPU acceleration for MinHash computation (requires RAPIDS cuDF)",
-    )
-    parser.add_argument(
         "--num-gpus",
         type=int,
         default=1,
-        help="Number of GPUs to use",
+        help="Number of GPUs to use in ray cluster",
     )
     parser.add_argument(
         "--gpu-batch-size",
         type=int,
-        default=1,
-        help="Number of parquet files to process per GPU batch (default: 1)",
+        default=1000*100,
+        help="Batch size for GPU processing (larger = better GPU utilization)",
     )
     parser.add_argument(
         "--num-gpus-per-task",
@@ -646,35 +829,46 @@ def main():
         help="Number of GPUs per task (default: 1.0). "
              "Set lower (e.g., 0.5) to improve GPU utilization through pipelining.",
     )
+    parser.add_argument(
+        "--minhash-checkpoint-uri",
+        type=str,
+        help="Checkpoint URI for minhash bands",
+    )
+    parser.add_argument(
+        "--edges-checkpoint-uri",
+        type=str,
+        help="Checkpoint URI for edges",
+    )
+    parser.add_argument(
+        "--components-checkpoint-uri",
+        type=str,
+        help="Checkpoint URI for deduplicated connected components",
+    )
 
     args = parser.parse_args()
 
-    ray.init(num_gpus=args.num_gpus)
+    ray.init(num_gpus=args.num_gpus, _temp_dir=os.environ.get("RAY_TMP_DIR", "/tmp/ray"))
     if args.disable_progress_bars:
         ray.data.DataContext.get_current().enable_progress_bars = False
 
     # Read input data
-    logger.info(f"Reading data from {args.input}")
+    logger.info("Reading data from %s", args.input)
     input_path = args.input
 
     # List all parquet files in the directory (supports both GCS and local paths)
     list_of_all_input_files = list_parquet_files(input_path)
-    logger.info(f"Reading {len(list_of_all_input_files)} parquet files")
+    logger.info("Reading %s parquet files", len(list_of_all_input_files))
 
-    if args.use_gpu:
-        ds = ray.data.from_items([{"filename": f} for f in list_of_all_input_files])
-    else:
-        ds = ray.data.read_parquet(list_of_all_input_files, columns=[args.id_column, args.text_column])
-
+    ds = ray.data.read_parquet(list_of_all_input_files)
     input_count = ds.count()
-    print(f"Original input count {input_count}")
+    logger.info("Original input count: %s", input_count)
     if args.limit is not None:
         logger.info(f"Limiting input to {args.limit} documents")
         assert input_count >= args.limit
         ds = ds.limit(args.limit)
         input_count = args.limit
 
-    logger.info(f"Starting large-scale deduplication with threshold={args.threshold}")
+    logger.info("Starting large-scale deduplication with threshold=%s", args.threshold)
 
     bands_ds = get_or_create_minhash_bands(
         ds,
@@ -685,52 +879,64 @@ def main():
         seed=args.seed,
         minhash_checkpoint_uri=args.minhash_checkpoint_uri,
         output_blocks=args.parallelism,
-        use_gpu=args.use_gpu,
+        num_gpus=args.num_gpus,
         gpu_batch_size=args.gpu_batch_size,
         num_gpus_per_task=args.num_gpus_per_task
     )
-
-    # TODO - remove this after testing
-    return
 
     # Duplicate components: Schema: ['node', 'parent']
     duplicate_components = find_duplicate_components(
         bands_ds,
         max_cc_iterations=args.max_cc_iterations,
-        hash_parallelism=args.parallelism
+        hash_parallelism=args.parallelism,
+        num_gpus=args.num_gpus,
+        edges_checkpoint_uri=args.edges_checkpoint_uri,
     )
     duplicate_components = duplicate_components.materialize()
     duplicate_count = duplicate_components.count()
 
-    # Join with original dataset to get full document content
-    if args.use_gpu:
-        ds = ray.data.read_parquet(list_of_all_input_files, columns=[args.id_column, args.text_column])
-        input_count = ds.count()
+    if args.components_checkpoint_uri is not None:
+        duplicate_components.write_parquet(args.components_checkpoint_uri)
 
+    # Join with original dataset to get full document content
+    logger.info("Step 8: Joining with original dataset...")
+    join_start_time = time.time()
     if duplicate_count == 0:
         # No duplicates found, skip the join
         logger.info("No duplicates found, skipping join.")
         deduplicated_ds = ds
     else:
-        deduplicated_ds = ds.join(
-            duplicate_components,
-            on=(args.id_column,),
-            right_on=('node',),
-            join_type='left_anti',
-            num_partitions=args.parallelism)
-
+        if args.num_gpus > 0:
+            logger.info("Joining with original dataset using GPU...")
+            deduplicated_ds = ds.gpu(nranks=args.num_gpus).join(
+                duplicate_components,
+                on=(args.id_column,),
+                right_on=('node',),
+                join_type='left_anti',
+                num_partitions=args.parallelism)
+        else:
+            logger.info("Joining with original dataset using CPU...")
+            deduplicated_ds = ds.join(
+                duplicate_components,
+                on=(args.id_column,),
+                right_on=('node',),
+                join_type='left_anti',
+                num_partitions=args.parallelism)
     deduplicated_ds = deduplicated_ds.materialize()
+    join_end_time = time.time()
+    logger.info("Step 8 time: %s seconds", join_end_time - join_start_time)
 
     # Write output
-    logger.info(f"Writing deduplicated data to {args.output}")
+    write_start_time = time.time()
+    logger.info("Step 9: Writing deduplicated data to %s", args.output)
     deduplicated_ds.write_parquet(args.output)
-
     output_count = deduplicated_ds.count()
+    write_end_time = time.time()
+    logger.info("Step 9 time: %s seconds", write_end_time - write_start_time)
 
-    logger.info(f"Input dataset: {input_count} documents")
-    logger.info(f"Output dataset: {output_count} documents")
-    logger.info(f"Removed {input_count - output_count} duplicates ({100*(input_count - output_count)/input_count:.1f}%)")
-
+    logger.info("Input dataset: %s documents", input_count)
+    logger.info("Output dataset: %s documents", output_count)
+    logger.info("Removed %s duplicates (%s%%)", input_count - output_count, 100*(input_count - output_count)/input_count)
 
 
 def compute_connected_components_pandas(edges_df: pd.DataFrame) -> pd.DataFrame:
