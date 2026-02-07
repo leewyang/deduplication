@@ -125,6 +125,14 @@ class GPUDataset():
         right_on=None,
         join_type='inner',
         num_partitions=None,
+        *,
+        num_sub_partitions=16,
+        join_chunk_rows=100_000,
+        merge_chunk_rows=500_000,
+        left_shuffle_chunk_rows=1_000_000,
+        enable_auto_partition_adjust=True,
+        enable_cpu_fallback=False,
+        memory_safety_margin=0.5,
     ) -> "GPUDataset":
         """GPU-accelerated join implementation.
 
@@ -132,15 +140,22 @@ class GPUDataset():
             right_ds: Right dataset to join (can be Dataset or GPUDataset)
             on: Join key(s) for left dataset (string or list of strings)
             right_on: Join key(s) for right dataset (default: same as on)
-            how: Join type - 'inner', 'left', or 'left_anti'
+            join_type: Join type - 'inner', 'left', or 'left_anti'
             num_partitions: Number of partitions for shuffle (default: nranks)
+            num_sub_partitions: Sub-partitions per GPU to reduce peak memory.
+            join_chunk_rows: Max rows per chunk when sub-partitioning (smaller = less GPU memory).
+            merge_chunk_rows: For left_anti, merge left in chunks (0 = no chunking).
+            left_shuffle_chunk_rows: Max left rows per shuffle chunk (0 = shuffle all at once).
+            enable_auto_partition_adjust: Auto-increase num_partitions when partitions are too large.
+            enable_cpu_fallback: On GPU OOM, retry with Ray Data CPU join.
+            memory_safety_margin: Fraction of free GPU memory used as safe partition size.
 
         Returns:
             GPUDataset wrapping the join result
 
         Example:
             result = left_ds.gpu(nranks=4).join(
-                right_ds, on='id', how='inner'
+                right_ds, on='id', join_type='inner'
             ).materialize()
         """
         from gpu_join import GPUJoinExecutor
@@ -160,7 +175,6 @@ class GPUDataset():
         right_on_list = right_on if right_on else on_list
         right_on_list = right_on_list if isinstance(right_on_list, list) else [right_on_list]
 
-        # Execute join
         executor = GPUJoinExecutor(
             left_ds=self.dataset,
             right_ds=right_ds,
@@ -169,6 +183,13 @@ class GPUDataset():
             right_on=right_on_list,
             join_type=join_type,
             num_partitions=num_partitions or self.nranks,
+            num_sub_partitions=num_sub_partitions,
+            join_chunk_rows=join_chunk_rows,
+            merge_chunk_rows=merge_chunk_rows,
+            left_shuffle_chunk_rows=left_shuffle_chunk_rows,
+            enable_auto_partition_adjust=enable_auto_partition_adjust,
+            enable_cpu_fallback=enable_cpu_fallback,
+            memory_safety_margin=memory_safety_margin,
         )
 
         result_ds = executor.execute()
