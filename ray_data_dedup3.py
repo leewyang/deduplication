@@ -27,9 +27,9 @@ import pandas as pd
 import ray
 from scipy import integrate
 
-import dataset_extensions  # noqa: F401, monkey-patch ray.data.Dataset
+import gpu_dataset  # noqa: F401, monkey-patch ray.data.Dataset
 from minhash_gpu import GPUMinHash
-from shuffle_gpu import create_edges_from_collisions_gpu_block, dataset_to_gpu
+from shuffle_gpu import create_edges_from_collisions_gpu_block
 from util import check_path_exists, list_parquet_files
 
 
@@ -839,6 +839,11 @@ def main():
         type=str,
         help="Checkpoint URI for edges",
     )
+    parser.add_argument(
+        "--components-checkpoint-uri",
+        type=str,
+        help="Checkpoint URI for deduplicated connected components",
+    )
 
     args = parser.parse_args()
 
@@ -889,6 +894,9 @@ def main():
     )
     duplicate_components = duplicate_components.materialize()
     duplicate_count = duplicate_components.count()
+
+    if args.components_checkpoint_uri is not None:
+        duplicate_components.write_parquet(args.components_checkpoint_uri)
 
     # Join with original dataset to get full document content
     logger.info("Step 8: Joining with original dataset...")
