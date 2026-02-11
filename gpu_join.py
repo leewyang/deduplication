@@ -1,4 +1,4 @@
-from typing import List, Iterator
+from typing import List, Tuple
 import logging
 
 import cudf
@@ -89,13 +89,11 @@ class GPUJoinActor(BulkRapidsMPFShuffler):
 
         # Extract and store shuffled right partitions
         logger.info(f"Rank {rank}: Extracting right partitions...")
+        right_partitions = []
         for partition_id, partition in self.extract():
             cdf = pylibcudf_to_cudf_dataframe(partition, self.right_columns)
-            self.stored_right_partitions.append(cdf)
-            logger.info(f"Rank {rank}: Stored right partition {partition_id} with {len(cdf)} rows")
-
-        total_right_rows = sum(len(cdf) for cdf in self.stored_right_partitions)
-        logger.info(f"Rank {rank}: Phase 1 complete - stored {len(self.stored_right_partitions)} partitions, {total_right_rows} total rows")
+            right_partitions.append(cdf)
+        self.stored_right_df = cudf.concat(right_partitions)
 
         # Reset for Phase 2 (left dataset shuffle)
         self._reset_for_left_shuffle()
@@ -142,170 +140,31 @@ class GPUJoinActor(BulkRapidsMPFShuffler):
         """
         self._reset_for_left_shuffle()
 
-    def _compute_sub_partition_ids(
-        self, cdf: cudf.DataFrame, keys: List[str], num_sub_partitions: int
-    ) -> cudf.Series:
-        """Compute sub-partition IDs based on hash of join keys.
-
-        Args:
-            cdf: cuDF DataFrame
-            keys: Join key column names
-            num_sub_partitions: Number of sub-partitions
-
-        Returns:
-            Series of sub-partition IDs (0 to num_sub_partitions-1)
-        """
-        # Use cuDF's hash_values for GPU-accelerated hashing
-        if len(keys) == 1:
-            hash_vals = cdf[keys[0]].hash_values()
-        else:
-            # For multiple keys, hash each and XOR combine
-            hash_vals = cdf[keys[0]].hash_values()
-            for key in keys[1:]:
-                hash_vals = hash_vals ^ cdf[key].hash_values()
-
-        # Modulo to get sub-partition ID (ensure non-negative)
-        return (hash_vals % num_sub_partitions).abs()
-
-    def _sub_partition_df_chunked(
-        self,
-        cdf: cudf.DataFrame,
-        keys: List[str],
-        num_sub_partitions: int,
-        out_by_sub: List[List],
-        chunk_rows: int,
-    ) -> int:
-        """Append rows of cdf into out_by_sub by sub-partition, processing in row chunks to bound memory.
-
-        Returns total number of rows processed.
-        """
-        n = len(cdf)
-        if n == 0:
-            return 0
-        for start in range(0, n, chunk_rows):
-            end = min(start + chunk_rows, n)
-            chunk = cdf.iloc[start:end]
-            sub_ids = self._compute_sub_partition_ids(chunk, keys, num_sub_partitions)
-            for sub_id in range(num_sub_partitions):
-                mask = (sub_ids == sub_id)
-                sub_cdf = chunk[mask]
-                if len(sub_cdf) > 0:
-                    out_by_sub[sub_id].append(sub_cdf)
-            del chunk, sub_ids
-        return n
-
     def execute_join(
         self,
-        num_sub_partitions: int = 16,
-        join_chunk_rows: int = 100_000,
-        merge_chunk_rows: int = 500_000,
-    ) -> Iterator[pa.Table]:
-        """Phase 3: Extract left partitions and join with stored right partitions.
+    ) -> List[pa.Table]:
+        """Phase 3: Extract left partitions in chunks and join with stored right partitions.
 
-        Uses sub-partitioning by secondary hash and chunked processing to handle datasets
-        larger than GPU memory. Each sub-partition is processed independently, yielding
-        results as they're ready.
-
-        Args:
-            num_sub_partitions: Number of sub-partitions to divide data into.
-                Higher values reduce peak memory but increase overhead.
-            join_chunk_rows: Max rows per chunk when sub-partitioning left/right data.
-                Smaller values reduce peak GPU memory at the cost of more passes.
-            merge_chunk_rows: For left_anti, process left side in chunks of this size
-                when merging to avoid OOM. Ignored for inner/left.
-
-        Yields:
-            PyArrow tables with join results, one per sub-partition.
+        Returns:
+            List of PyArrow tables with join results, one per partition.
         """
         if self.phase != 'left':
             raise RuntimeError(f"Cannot execute join in phase '{self.phase}'. Must complete both shuffles first.")
 
-        rank = self.rank()
-        logger.info(
-            f"Rank {rank}: Phase 3 - Executing join with {num_sub_partitions} sub-partitions, "
-            f"join_chunk_rows={join_chunk_rows}, merge_chunk_rows={merge_chunk_rows}..."
-        )
-
-        # Step 1: Sub-partition stored right data by secondary hash (chunked to bound memory)
-        right_by_sub = [[] for _ in range(num_sub_partitions)]
-        total_right_rows = 0
-        logger.info(f"Rank {rank}: Sub-partitioning {len(self.stored_right_partitions)} stored right partitions...")
-        for cdf in self.stored_right_partitions:
-            if len(cdf) == 0:
-                continue
-            total_right_rows += self._sub_partition_df_chunked(
-                cdf, self.right_keys, num_sub_partitions, right_by_sub, join_chunk_rows
-            )
-        self.stored_right_partitions = []
-        logger.info(f"Rank {rank}: Right data sub-partitioned ({total_right_rows} total rows)")
-
-        # Step 2: Extract left partitions and sub-partition them in chunks
-        left_by_sub = [[] for _ in range(num_sub_partitions)]
-        total_left_rows = 0
-        logger.info(f"Rank {rank}: Extracting and sub-partitioning left data...")
-        for partition_id, left_partition in self.extract():
+        results: List[pa.Table] = []
+        for idx, (partition_id, left_partition) in enumerate(self.extract()):
             left_cdf = pylibcudf_to_cudf_dataframe(left_partition, self.left_columns)
             if len(left_cdf) == 0:
                 continue
-            total_left_rows += self._sub_partition_df_chunked(
-                left_cdf, self.left_keys, num_sub_partitions, left_by_sub, join_chunk_rows
-            )
-            del left_cdf
+            result = self._merge_join(left_cdf, self.stored_right_df)
+            results.append(result.to_arrow(preserve_index=False))
 
-        logger.info(f"Rank {rank}: Left data sub-partitioned ({total_left_rows} total rows)")
-
-        # Step 3: Process each sub-partition pair, yielding results as they're ready
-        total_result_rows = 0
-        for sub_id in range(num_sub_partitions):
-            # Prepare right sub-partition
-            if right_by_sub[sub_id]:
-                right_sub = cudf.concat(right_by_sub[sub_id])
-                right_sub = right_sub.sort_values(by=self.right_keys)
-                # Free the list to allow GC
-                right_by_sub[sub_id] = []
-            else:
-                right_sub = None
-
-            # Prepare left sub-partition
-            if left_by_sub[sub_id]:
-                left_sub = cudf.concat(left_by_sub[sub_id])
-                left_sub = left_sub.sort_values(by=self.left_keys)
-                # Free the list to allow GC
-                left_by_sub[sub_id] = []
-            else:
-                left_sub = None
-
-            # Skip if no left data for this sub-partition
-            if left_sub is None or len(left_sub) == 0:
-                continue
-
-            # Perform join (chunked for left_anti when left is large to avoid OOM)
-            if right_sub is not None and len(right_sub) > 0:
-                result = self._merge_join(
-                    left_sub, right_sub, merge_chunk_rows=merge_chunk_rows
-                )
-            else:
-                # Handle empty right dataset based on join type
-                if self.join_type in ('left', 'left_anti'):
-                    result = left_sub[self.left_columns]
-                else:  # inner join
-                    continue
-
-            if len(result) > 0:
-                total_result_rows += len(result)
-                logger.debug(f"Rank {rank}: Sub-partition {sub_id} yielded {len(result)} rows")
-                yield result.to_arrow(preserve_index=False)
-
-            # Explicitly delete to help GC
-            del right_sub, left_sub
-
-        logger.info(f"Rank {rank}: Join complete, total result: {total_result_rows} rows")
+        return results
 
     def _merge_join(
         self,
         left_cdf: cudf.DataFrame,
         right_cdf: cudf.DataFrame,
-        merge_chunk_rows: int = 500_000,
     ) -> cudf.DataFrame:
         """Perform sort-merge join on sorted DataFrames.
 
@@ -314,53 +173,26 @@ class GPUJoinActor(BulkRapidsMPFShuffler):
         Args:
             left_cdf: Sorted left DataFrame
             right_cdf: Sorted right DataFrame
-            merge_chunk_rows: For left_anti, process left in chunks of this size (0 = no chunking).
 
         Returns:
             Joined DataFrame
         """
-        if self.join_type in ['inner', 'left']:
-            return left_cdf.merge(
-                right_cdf,
-                left_on=self.left_keys,
-                right_on=self.right_keys,
-                how=self.join_type,
-            )
-        elif self.join_type == 'left_anti':
-            # Chunked left_anti when left is large to avoid OOM (merge + temp can double memory)
-            n_left = len(left_cdf)
-            if merge_chunk_rows > 0 and n_left > merge_chunk_rows:
-                right_cdf_marked = right_cdf.copy()
-                right_cdf_marked['__right_marker__'] = 1
-                right_keys_marked = [*self.right_keys, '__right_marker__']
-                parts = []
-                for start in range(0, n_left, merge_chunk_rows):
-                    end = min(start + merge_chunk_rows, n_left)
-                    chunk = left_cdf.iloc[start:end]
-                    temp = chunk.merge(
-                        right_cdf_marked[right_keys_marked],
-                        left_on=self.left_keys,
-                        right_on=self.right_keys,
-                        how='left',
-                    )
-                    part = temp[temp['__right_marker__'].isna()][self.left_columns]
-                    if len(part) > 0:
-                        parts.append(part)
-                    del chunk, temp, part
-                return cudf.concat(parts) if parts else left_cdf[self.left_columns].head(0)
-            # Single pass
-            right_cdf_marked = right_cdf.copy()
-            right_cdf_marked['__right_marker__'] = 1
-            temp = left_cdf.merge(
-                right_cdf_marked[[*self.right_keys, '__right_marker__']],
-                left_on=self.left_keys,
-                right_on=self.right_keys,
-                how='left',
-            )
-            result = temp[temp['__right_marker__'].isna()][self.left_columns]
-            return result
+        join_mapping = {
+            'inner': 'inner',
+            'left': 'left',
+            'left_anti': 'leftanti',
+        }
+        if self.join_type in join_mapping:
+            how = join_mapping[self.join_type]
         else:
             raise ValueError(f"Unsupported join type: {self.join_type}")
+
+        return left_cdf.merge(
+            right_cdf,
+            left_on=self.left_keys,
+            right_on=self.right_keys,
+            how=how,
+        )
 
 
 class GPUJoinExecutor:
@@ -376,9 +208,6 @@ class GPUJoinExecutor:
         join_type: str,
         num_partitions: int,
         *,
-        num_sub_partitions: int = 16,
-        join_chunk_rows: int = 100_000,
-        merge_chunk_rows: int = 500_000,
         left_shuffle_chunk_rows: int = 1_000_000,
         enable_auto_partition_adjust: bool = True,
         enable_cpu_fallback: bool = False,
@@ -394,9 +223,6 @@ class GPUJoinExecutor:
             right_on: Join keys for right dataset
             join_type: Join type ('inner', 'left', 'left_anti')
             num_partitions: Number of partitions for shuffle (default: nranks)
-            num_sub_partitions: Sub-partitions per GPU to reduce peak memory.
-            join_chunk_rows: Max rows per chunk when sub-partitioning (smaller = less GPU memory).
-            merge_chunk_rows: For left_anti, merge left in chunks of this size (0 = no chunking).
             left_shuffle_chunk_rows: Max left rows per shuffle chunk (0 = shuffle all left at once).
             enable_auto_partition_adjust: If True, increase num_partitions when estimated size exceeds GPU memory.
             enable_cpu_fallback: If True, on GPU OOM retry with Ray Data CPU join.
@@ -409,9 +235,6 @@ class GPUJoinExecutor:
         self.right_on = right_on
         self.join_type = join_type
         self.num_partitions = num_partitions
-        self.num_sub_partitions = num_sub_partitions
-        self.join_chunk_rows = join_chunk_rows
-        self.merge_chunk_rows = merge_chunk_rows
         self.left_shuffle_chunk_rows = left_shuffle_chunk_rows
         self.enable_auto_partition_adjust = enable_auto_partition_adjust
         self.enable_cpu_fallback = enable_cpu_fallback
@@ -618,23 +441,15 @@ class GPUJoinExecutor:
                 total_rows += chunk_rows
             else:
                 # Chunked: shuffle left in chunks of left_shuffle_chunk_rows, join each chunk
-                batch_size = 100_000
                 target_chunk_rows = self.left_shuffle_chunk_rows
                 chunk_index = 0
-                chunk_tables_acc: List[pa.Table] = []
-                chunk_row_count = 0
 
-                for batch in self.left_ds.iter_batches(batch_size=batch_size, batch_format="pyarrow"):
-                    chunk_tables_acc.append(batch)
-                    chunk_row_count += len(batch)
-                    if chunk_row_count < target_chunk_rows:
-                        continue
-
+                for batch in self.left_ds.iter_batches(batch_size=target_chunk_rows, batch_format="pyarrow"):
                     # Shuffle this chunk and run join
-                    chunk_ds = ray.data.from_arrow(chunk_tables_acc)
+                    chunk_ds = ray.data.from_arrow(batch)
                     logger.info("=" * 60)
                     logger.info(
-                        f"PHASE 2+3 (chunk {chunk_index}): Shuffling left chunk ({chunk_row_count} rows)..."
+                        f"PHASE 2+3 (chunk {chunk_index}): Shuffling left chunk ({len(batch)} rows)..."
                     )
                     logger.info("=" * 60)
                     ray.get([actor.start_left_chunk.remote() for actor in actors])
@@ -644,25 +459,7 @@ class GPUJoinExecutor:
                     result_tables.extend(ct)
                     total_rows += cr
                     logger.info(f"Chunk {chunk_index} complete: {cr} result rows (cumulative {total_rows})")
-                    chunk_tables_acc = []
-                    chunk_row_count = 0
                     chunk_index += 1
-
-                # Last partial chunk
-                if chunk_tables_acc:
-                    chunk_ds = ray.data.from_arrow(chunk_tables_acc)
-                    logger.info("=" * 60)
-                    logger.info(
-                        f"PHASE 2+3 (chunk {chunk_index}): Shuffling left chunk ({chunk_row_count} rows)..."
-                    )
-                    logger.info("=" * 60)
-                    ray.get([actor.start_left_chunk.remote() for actor in actors])
-                    self._shuffle_dataset_into_actors(actors, chunk_ds, self.on, is_right=False)
-                    ray.get([actor.left_insert_finished.remote() for actor in actors])
-                    ct, cr = self._collect_join_results(actors)
-                    result_tables.extend(ct)
-                    total_rows += cr
-                    logger.info(f"Chunk {chunk_index} complete: {cr} result rows (cumulative {total_rows})")
 
             if len(result_tables) == 0:
                 logger.info("No matching rows found, returning empty dataset")
@@ -682,47 +479,16 @@ class GPUJoinExecutor:
                 return self._execute_cpu_join()
             raise
 
-    def _collect_join_results(self, actors: List) -> tuple:
+    def _collect_join_results(self, actors: List) -> Tuple[List[pa.Table], int]:
         """Run Phase 3 (execute_join) on actors and collect all result tables.
 
         Returns:
             (result_tables, total_rows)
         """
-        generators = [
-            actor.execute_join.remote(
-                num_sub_partitions=self.num_sub_partitions,
-                join_chunk_rows=self.join_chunk_rows,
-                merge_chunk_rows=self.merge_chunk_rows,
-            )
-            for actor in actors
-        ]
-        iters = [iter(gen) for gen in generators]
-        pending_refs = []
-        ref_to_iter = {}
-        for it in iters:
-            try:
-                ref = next(it)
-                pending_refs.append(ref)
-                ref_to_iter[ref] = it
-            except StopIteration:
-                pass
-        result_tables = []
-        total_rows = 0
-        while pending_refs:
-            ready_refs, pending_refs = ray.wait(pending_refs, num_returns=1)
-            for ref in ready_refs:
-                table = ray.get(ref)
-                if len(table) > 0:
-                    result_tables.append(table)
-                    total_rows += len(table)
-                it = ref_to_iter.pop(ref)
-                try:
-                    next_ref = next(it)
-                    pending_refs.append(next_ref)
-                    ref_to_iter[next_ref] = it
-                except StopIteration:
-                    pass
-        return result_tables, total_rows
+        # Each actor returns List[pa.Table]; flatten into one list of tables
+        per_actor_results = ray.get([actor.execute_join.remote() for actor in actors])
+        result_tables = [t for tables in per_actor_results for t in tables]
+        return result_tables, sum(len(table) for table in result_tables)
 
     def _execute_cpu_join(self) -> ray.data.Dataset:
         """Run join on CPU using Ray Data native implementation."""
