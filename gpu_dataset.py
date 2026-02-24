@@ -1,3 +1,4 @@
+import time
 from typing import Optional, Union, List, Callable, Dict, Any, Literal
 import logging
 
@@ -23,8 +24,11 @@ class GPUDataset():
     def __del__(self):
         if self.dataset is not None:
             self.dataset.__del__()
+        if self.actors is not None:
+            self.print_stats()
 
     def groupby(self, key: Union[str, List[str], None], num_partitions: Optional[int] = None) -> "GPUDataset":
+        self.t_wall_start = time.monotonic()
         self.key = key if isinstance(key, list) else [key]
         self.num_partitions = num_partitions if num_partitions else self.nranks
 
@@ -44,17 +48,20 @@ class GPUDataset():
         _, root_address = ray.get(self.actors[0].setup_root.remote())
         ray.get([actor.setup_worker.remote(root_address) for actor in self.actors])
         self.pool = ActorPool(self.actors)
-        logger.info(f"Actor pool setup complete")
+        self.t_setup = time.monotonic() - self.t_wall_start
+        logger.info(f"Actor pool setup complete: {self.t_setup:.2f} seconds")
 
         # insert dataset chunks into the actors
+        t_insert_start = time.monotonic()
         batches = self.dataset.iter_batches(batch_size=1000*100, batch_format="pyarrow")
         batch_counts = list(self.pool.map(lambda actor, batch: actor.insert_batch.remote(batch), batches))
         logger.info(f"Total number of batches: {len(batch_counts)}")
         logger.info(f"Total number of items: {sum(batch_counts)}")
-        logger.info(f"Actor pool insert chunks complete")
 
         # insert finished markers into the actors
         ray.get([actor.insert_finished.remote() for actor in self.actors])
+        self.t_insert = time.monotonic() - t_insert_start
+        logger.info(f"Actor pool insert chunks complete: {self.t_insert:.2f} seconds")
         return self
 
     def map_groups(
@@ -72,6 +79,7 @@ class GPUDataset():
             **kwargs: ignored keyword arguments, for API compatibility.
         """
         # Get generators from all actors - each yields partitions as they become ready
+        t_extract_start = time.monotonic()
         generators = [actor.extract_partitions.remote(fn, fn_type) for actor in self.actors]
 
         # Convert to iterators and seed initial refs from each
@@ -109,14 +117,18 @@ class GPUDataset():
 
         logger.info(f"Number of chunks: {len(chunks)}")
         logger.info(f"Number of items in chunks: {total_rows}")
-        logger.info(f"Actor pool read complete")
 
         # convert the list of pyarrow tables to a ray dataset
         self.dataset = ray.data.from_arrow(chunks)
+        self.t_extract = time.monotonic() - t_extract_start
+        logger.info(f"Actor pool read complete: {self.t_extract:.2f} seconds")
+
         return self
 
     def materialize(self) -> ray.data.Dataset:
-        return self.dataset.materialize()
+        ds = self.dataset.materialize()
+        self.t_wall_total = time.monotonic() - self.t_wall_start
+        return ds
 
     def join(
         self,
@@ -185,6 +197,35 @@ class GPUDataset():
 
         result_ds = executor.execute()
         return GPUDataset(result_ds, nranks=self.nranks)
+
+    def print_stats(self):
+        final_stats = ray.get([actor.get_stats.remote() for actor in self.actors])
+
+        print("\n" + "=" * 60)
+        print("Timing Summary")
+        print("=" * 60)
+        print("\n  Driver wall-clock:")
+        print(f"    {'Setup':.<30s} {self.t_setup:>8.2f}s")
+        print(f"    {'Insert':.<30s} {self.t_insert:>8.2f}s")
+        print(f"    {'Extract':.<30s} {self.t_extract:>8.2f}s")
+        print(f"    {'Total':.<30s} {self.t_wall_total:>8.2f}s")
+
+        # Per-actor cumulative times (these overlap due to pipelining)
+        print("\n  Per-actor cumulative (pipelined - phases overlap):")
+        header = (
+            f"    {'Actor':>5s}  "
+            f"{'Xfer Push':>10s}  {'Xfer Recv':>10s}  {'Finalize':>10s}"
+        )
+        print(header)
+        print(f"    {'-----':>5s}  "
+              f"{'----------':>10s}  {'----------':>10s}  {'----------':>10s}")
+        for aid, s in enumerate(final_stats):
+            print(
+                f"    {aid:>5d}  "
+                f"{s['time_transfer_push']:>9.2f}s  "
+                f"{s['time_transfer_recv']:>9.2f}s  "
+                f"{s['time_finalize']:>9.2f}s"
+            )
 
 def _get_available_gpus() -> int:
     """Detect available GPUs using Ray's available_resources()."""

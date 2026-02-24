@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any, Callable, Iterator, Literal, Optional
 
 import cudf
@@ -27,12 +28,19 @@ class GPUShuffleActor(BulkRapidsMPFShuffler):
         super().__init__(nranks=nranks, total_nparts=hash_parallelism, shuffle_on=group_by, **kwargs)
         self.columns = columns
         self.group_by = group_by
+
+        self.time_transfer_push = 0.0
+        self.time_transfer_recv = 0.0
+        self.time_finalize = 0.0
+
         logger.info(f"Rank {self.rank} setup complete")
 
     def insert_batch(self, batch: pa.Table) -> int:
+        t0 = time.monotonic()
         df = cudf.DataFrame.from_arrow(batch)
         # self.columns = list(df.columns)
         self.insert_chunk(table=df, column_names=self.columns)
+        self.time_transfer_push += time.monotonic() - t0
         return len(batch)
 
     def extract_partitions(
@@ -59,9 +67,12 @@ class GPUShuffleActor(BulkRapidsMPFShuffler):
             # Convert partition to cuDF DataFrame immediately. Copy to materialize
             # spillable buffers and avoid "An owning spillable buffer must either be
             # exposed or spill locked" when groupby().apply() concats chunk results.
+            t0 = time.monotonic()
             cdf = pylibcudf_to_cudf_dataframe(partition, self.columns).copy(deep=True)
+            self.time_transfer_recv += time.monotonic() - t0
 
             # Apply the map_groups_fn to this partition, if provided
+            t1 = time.monotonic()
             if map_groups_fn:
                 if fn_type == "group":
                     # result = cdf.groupby(self.group_by).apply(map_groups_fn)
@@ -82,8 +93,16 @@ class GPUShuffleActor(BulkRapidsMPFShuffler):
                     raise ValueError(f"Invalid fn_type: {fn_type}")
             else:
                 result = cdf if len(cdf) > 0 else cudf.DataFrame({col: [] for col in self.columns})
+            self.time_finalize += time.monotonic() - t1
 
             logger.debug(f"Rank {self.rank}: Yielding partition {partition_idx} with {len(result)} rows")
             # preserve_index=False avoids "Cannot insert 'key', already exists" when groupby().apply()
             # returns a result with the group key in the index and also in the columns
             yield result.to_arrow(preserve_index=False)
+
+    def get_stats(self) -> dict[str, float]:
+        return {
+            "time_transfer_push": self.time_transfer_push,
+            "time_transfer_recv": self.time_transfer_recv,
+            "time_finalize": self.time_finalize,
+        }
