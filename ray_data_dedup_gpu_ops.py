@@ -646,7 +646,7 @@ def find_duplicate_components(
         logger.info("Generating edges")
         logger.info("Number of blocks in bands_ds: %s", bands_ds.num_blocks())
         if num_gpus > 0:
-            logger.info("Step 3. Grouping by bands to find candidate pairs using GPU...")
+            logger.info("Step 3: Grouping by bands to find candidate pairs using GPU...")
             edges_ds = (
                 bands_ds
                 .groupby(['band_id', 'band_hash'], num_partitions=int(hash_parallelism/10))
@@ -855,7 +855,9 @@ def main():
     if args.disable_progress_bars:
         ray.data.DataContext.get_current().enable_progress_bars = False
     if args.num_gpus > 0:
-        ray.data.context.DataContext.get_current().shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+        ctx = ray.data.context.DataContext.get_current()
+        ctx.shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
+        ctx.gpu_join_left_chunk_rows = 100_000
 
     # Read input data
     logger.info("Reading data from %s", args.input)
@@ -891,18 +893,22 @@ def main():
     )
 
     # Duplicate components: Schema: ['node', 'parent']
-    duplicate_components = find_duplicate_components(
-        bands_ds,
-        max_cc_iterations=args.max_cc_iterations,
-        hash_parallelism=args.parallelism,
-        num_gpus=args.num_gpus,
-        edges_checkpoint_uri=args.edges_checkpoint_uri,
-    )
-    duplicate_components = duplicate_components.materialize()
+    if args.components_checkpoint_uri is not None and check_path_exists(args.components_checkpoint_uri):
+        logger.info("Reading components from checkpoint: %s", args.components_checkpoint_uri)
+        duplicate_components = ray.data.read_parquet(args.components_checkpoint_uri)
+        duplicate_components = duplicate_components.materialize()
+    else:
+        duplicate_components = find_duplicate_components(
+            bands_ds,
+            max_cc_iterations=args.max_cc_iterations,
+            hash_parallelism=args.parallelism,
+            num_gpus=args.num_gpus,
+            edges_checkpoint_uri=args.edges_checkpoint_uri,
+        )
+        duplicate_components = duplicate_components.materialize()
+        if args.components_checkpoint_uri is not None:
+            duplicate_components.write_parquet(args.components_checkpoint_uri)
     duplicate_count = duplicate_components.count()
-
-    if args.components_checkpoint_uri is not None:
-        duplicate_components.write_parquet(args.components_checkpoint_uri)
 
     # Join with original dataset to get full document content
     logger.info("Step 8: Joining with original dataset...")
@@ -919,7 +925,7 @@ def main():
                 on=(args.id_column,),
                 right_on=('node',),
                 join_type='left_anti',
-                num_partitions=args.parallelism)
+                num_partitions=args.parallelism // 10)
         else:
             logger.info("Joining with original dataset using CPU...")
             deduplicated_ds = ds.join(

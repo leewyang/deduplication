@@ -20,6 +20,8 @@ class GPUDataset():
     def __init__(self, dataset: ray.data.Dataset, nranks: int):
         self.dataset = dataset
         self.nranks = nranks
+        self.actors = None
+        self.t_wall_start = time.monotonic()
 
     def __del__(self):
         if self.dataset is not None:
@@ -30,13 +32,13 @@ class GPUDataset():
     def groupby(self, key: Union[str, List[str], None], num_partitions: Optional[int] = None) -> "GPUDataset":
         self.t_wall_start = time.monotonic()
         self.key = key if isinstance(key, list) else [key]
-        self.num_partitions = num_partitions if num_partitions else self.nranks
+        num_parts = num_partitions if num_partitions else self.nranks
 
         # create the shuffle actors
         self.actors = [
             GPUShuffleActor.remote(
                 nranks=self.nranks,
-                hash_parallelism=self.num_partitions,
+                hash_parallelism=num_parts,
                 group_by=self.key,
                 columns=self.dataset.columns(),
                 rmm_pool_size=None,  # 50% of free GPU memory
@@ -66,7 +68,7 @@ class GPUDataset():
 
     def map_groups(
         self,
-        fn: Optional[Callable[[cudf.DataFrame], cudf.DataFrame]],
+        fn: Optional[Callable[[cudf.DataFrame], cudf.DataFrame]] = None,
         fn_type: Literal["block", "group"] = "block",
         **kwargs: Dict[str, Any],
     ) -> "GPUDataset":
