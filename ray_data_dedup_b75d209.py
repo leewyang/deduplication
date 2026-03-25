@@ -146,17 +146,17 @@ class MinHashGenerator:
 
 
 def generate_minhash_signatures_gpu(
-    batch: Dict[str, np.ndarray],
+    batch: cudf.DataFrame,
     text_column: str,
     num_perm: int,
     ngram_size: int,
     seed: int,
-) -> Dict[str, np.ndarray]:
+) -> cudf.DataFrame:
     """Generate MinHash signatures for a batch of documents using GPU."""
     generator = GPUMinHash(seed=seed, num_hashes=num_perm, char_ngrams=ngram_size)
     texts = batch[text_column]
-    signatures = generator.compute_minhashes(cudf.Series(texts, dtype='str').str.lower())
-    batch['minhash'] = signatures.list.leaves.values.get().reshape(-1, num_perm)
+    signatures = generator.compute_minhashes(texts.str.lower())
+    batch['minhash'] = signatures
     return batch
 
 
@@ -582,7 +582,7 @@ def get_or_create_minhash_bands(
                 'ngram_size': ngram_size,
                 'seed': seed,
             },
-            batch_format='numpy',
+            batch_format='cudf',
             batch_size=gpu_batch_size,
             num_gpus=num_gpus_per_task,
         )
