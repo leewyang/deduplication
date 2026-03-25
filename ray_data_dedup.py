@@ -913,7 +913,7 @@ def main():
                 on=(args.id_column,),
                 right_on=('node',),
                 join_type='left_anti',
-                num_partitions=args.parallelism)
+                num_partitions=args.parallelism // 10)
         else:
             logger.info("Joining with original dataset using CPU...")
             deduplicated_ds = ds.join(
