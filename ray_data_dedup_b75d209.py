@@ -264,7 +264,9 @@ def distinct_2col(
     parallelism: int = 100,
     num_gpus: int = 0,
 ) -> ray.data.Dataset:
-    if False:  # disable GPU version
+    if num_gpus > 0:
+        parallelism = int(parallelism / 10)
+    if False:
         logger.info("distinct_2col using GPU...")
         def distinct_map_groups_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
             unique_df = batch.drop_duplicates(subset=[col_1, col_2])
@@ -656,7 +658,9 @@ def find_duplicate_components(
     else:
         logger.info("Generating edges")
         logger.info("Number of blocks in bands_ds: %s", bands_ds.num_blocks())
-        if False:  # disable GPU version
+        if num_gpus > 0:
+            hash_parallelism = int(hash_parallelism / 10)
+        if False:
             logger.info("Step 3: Grouping by bands to find candidate pairs using GPU...")
             edges_ds = (
                 bands_ds
