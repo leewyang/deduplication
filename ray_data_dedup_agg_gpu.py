@@ -7,7 +7,8 @@ This implementation uses Ray Data's native operations (map_batches, aggregate, e
 to implement MinHash + LSH deduplication, similar to the Spark approach.
 
 This GPU-focused version is derived from ray_data_dedup_agg.py, but rewrites
-the hot aggregate stages to use built-in Count/Min AggregateFnV2 operations.
+the hot aggregate stages to use built-in Count/Min AggregateFnV2 operations
+and keyed GPU-shuffle/cuDF reductions for connected components.
 With DataContext.shuffle_strategy=GPU_SHUFFLE, those groupby().aggregate()
 calls are planned as GPUHashAggregateOperator instead of falling back to the
 CPU hash aggregate path for custom Python list aggregators.
@@ -15,7 +16,7 @@ CPU hash aggregate path for custom Python list aggregators.
 Architecture:
 1. MinHash signature generation (map_batches)
 2. LSH banding to generate candidate pairs (GPUHashAggregate Min/Count + join)
-3. Connected components (iterative GPUHashAggregate Min/Count reductions)
+3. Connected components (keyed GPU shuffle + block-local cuDF star reductions)
 """
 
 from typing import Any, Dict, List, Set, Tuple, Optional
@@ -294,45 +295,12 @@ def gpu_fused_cc_partitions(parallelism: int) -> int:
     return min(gpu_hash_partitions(parallelism), 8)
 
 
-def resolve_gpu_cc_impl(gpu_cc_impl: str, num_gpus: int) -> str:
-    if gpu_cc_impl == "auto":
-        return "fused-blocks" if num_gpus > 0 else "current"
-    return gpu_cc_impl
-
-
 def project_collision_edges_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
     """Project joined band rows into min-doc star edges on GPU."""
     batch = batch[batch["band_group_size"] > 1]
     return cudf.DataFrame({
         "src": batch["min_doc_id"],
         "dst": batch["doc_id"],
-    })
-
-
-def add_identity_parent_rows_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
-    """Add (node, node) rows so Min(parent) matches the Python star aggregators."""
-    pairs = batch[["node", "parent"]]
-    identities = cudf.DataFrame({
-        "node": batch["node"],
-        "parent": batch["node"],
-    })
-    return cudf.concat([pairs, identities], ignore_index=True)
-
-
-def project_large_star_edges_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
-    """Emit (neighbor, min_parent) for neighbors greater than the group node."""
-    batch = batch[batch["parent"] > batch["node"]]
-    return cudf.DataFrame({
-        "node": batch["parent"],
-        "parent": batch["min_parent"],
-    })
-
-
-def project_small_star_edges_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
-    """Emit (small_neighbor, min_parent) for every small-star neighbor row."""
-    return cudf.DataFrame({
-        "node": batch["parent"],
-        "parent": batch["min_parent"],
     })
 
 
@@ -495,54 +463,6 @@ def generate_edges_from_bands_gpu(
     )
 
 
-def large_star_gpu(
-    current_ds: ray.data.Dataset,
-    parallelism: int,
-) -> ray.data.Dataset:
-    num_partitions = gpu_hash_partitions(parallelism)
-    neighborhood_ds = (
-        current_ds
-        .map_batches(
-            large_star_emit_gpu,
-            batch_format="cudf",
-            num_gpus=1,
-            batch_size=100_000,
-        )
-        .map_batches(
-            add_identity_parent_rows_gpu,
-            batch_format="cudf",
-            num_gpus=1,
-            batch_size=100_000,
-        )
-        .materialize()
-    )
-
-    min_parent_ds = (
-        neighborhood_ds
-        .groupby(["node"], num_partitions=num_partitions)
-        .aggregate(Min(on="parent", alias_name="min_parent"))
-        .materialize()
-    )
-
-    current_ds = (
-        neighborhood_ds
-        .join(
-            min_parent_ds,
-            join_type="inner",
-            num_partitions=num_partitions,
-            on=("node",),
-        )
-        .map_batches(
-            project_large_star_edges_gpu,
-            batch_format="cudf",
-            num_gpus=1,
-            batch_size=100_000,
-        )
-        .materialize()
-    )
-    return gpu_distinct_2col(current_ds, "node", "parent", parallelism)
-
-
 def large_star_gpu_fused_blocks(
     current_ds: ray.data.Dataset,
     parallelism: int,
@@ -569,54 +489,6 @@ def large_star_gpu_fused_blocks(
         sort=True,
     ).materialize()
     return map_gpu_blocks(shuffled, local_large_star_reduce_gpu).materialize()
-
-
-def small_star_gpu(
-    current_ds: ray.data.Dataset,
-    parallelism: int,
-) -> ray.data.Dataset:
-    num_partitions = gpu_hash_partitions(parallelism)
-    neighborhood_ds = (
-        current_ds
-        .map_batches(
-            small_star_emit_gpu,
-            batch_format="cudf",
-            num_gpus=1,
-            batch_size=100_000,
-        )
-        .map_batches(
-            add_identity_parent_rows_gpu,
-            batch_format="cudf",
-            num_gpus=1,
-            batch_size=100_000,
-        )
-        .materialize()
-    )
-
-    min_parent_ds = (
-        neighborhood_ds
-        .groupby(["node"], num_partitions=num_partitions)
-        .aggregate(Min(on="parent", alias_name="min_parent"))
-        .materialize()
-    )
-
-    current_ds = (
-        neighborhood_ds
-        .join(
-            min_parent_ds,
-            join_type="inner",
-            num_partitions=num_partitions,
-            on=("node",),
-        )
-        .map_batches(
-            project_small_star_edges_gpu,
-            batch_format="cudf",
-            num_gpus=1,
-            batch_size=100_000,
-        )
-        .materialize()
-    )
-    return gpu_distinct_2col(current_ds, "node", "parent", parallelism)
 
 
 def small_star_gpu_fused_blocks(
@@ -932,7 +804,6 @@ def compute_connected_components_distributed(
     parallelism: int = 200,
     verbose=False,
     num_gpus: int = 0,
-    gpu_cc_impl: str = "auto",
 ) -> ray.data.Dataset:
     """
     Compute connected components using distributed large-star/small-star algorithm.
@@ -954,18 +825,9 @@ def compute_connected_components_distributed(
     Returns:
         Dataset with columns: node, parent (where parent is the component root)
     """
-    requested_gpu_cc_impl = gpu_cc_impl
-    gpu_cc_impl = resolve_gpu_cc_impl(gpu_cc_impl, num_gpus)
-    if gpu_cc_impl not in {"current", "fused-blocks"}:
-        raise ValueError(f"Unknown GPU connected-components implementation: {gpu_cc_impl}")
-
     logger.info(
         "Computing connected components with distributed algorithm%s...",
-        (
-            f" ({gpu_cc_impl}, requested={requested_gpu_cc_impl})"
-            if num_gpus > 0
-            else ""
-        ),
+        " (fused-blocks)" if num_gpus > 0 else "",
     )
 
     current_ds = current_ds.materialize()
@@ -977,15 +839,11 @@ def compute_connected_components_distributed(
         current_ds = current_ds.materialize()
         # Step 1: Large-star
         if num_gpus > 0:
-            if gpu_cc_impl == "fused-blocks":
-                current_ds = large_star_gpu_fused_blocks(current_ds, parallelism)
-                logger.info(
-                    "Length of large_star_gpu_fused_blocks: %s",
-                    current_ds.count(),
-                )
-            else:
-                current_ds = large_star_gpu(current_ds, parallelism)
-                logger.info("Length of large_star_gpu: %s", current_ds.count())
+            current_ds = large_star_gpu_fused_blocks(current_ds, parallelism)
+            logger.info(
+                "Length of large_star_gpu_fused_blocks: %s",
+                current_ds.count(),
+            )
         else:
             # CPU
             current_ds = current_ds.flat_map(large_star_emit, memory=8*2**30).materialize()
@@ -1004,15 +862,11 @@ def compute_connected_components_distributed(
 
         # Step 2: Small-star
         if num_gpus > 0:
-            if gpu_cc_impl == "fused-blocks":
-                current_ds = small_star_gpu_fused_blocks(current_ds, parallelism)
-                logger.info(
-                    "Length of small_star_gpu_fused_blocks: %s",
-                    current_ds.count(),
-                )
-            else:
-                current_ds = small_star_gpu(current_ds, parallelism)
-                logger.info("Length of small_star_gpu: %s", current_ds.count())
+            current_ds = small_star_gpu_fused_blocks(current_ds, parallelism)
+            logger.info(
+                "Length of small_star_gpu_fused_blocks: %s",
+                current_ds.count(),
+            )
         else:
             # CPU
             current_ds = current_ds.flat_map(small_star_emit).materialize()
@@ -1053,7 +907,7 @@ def compute_connected_components_distributed(
         print(f"convergence_counter: {convergence_counter}")
         print("-" * 10)
 
-    if num_gpus > 0 and gpu_cc_impl == "fused-blocks":
+    if num_gpus > 0:
         current_ds = gpu_distinct_2col(current_ds, "node", "parent", parallelism)
 
     return current_ds
@@ -1153,7 +1007,6 @@ def find_duplicate_components(
     hash_parallelism: int = 100,
     num_gpus: int = 0,
     edges_checkpoint_uri: Optional[str] = None,
-    gpu_cc_impl: str = "auto",
 ) -> ray.data.Dataset:
     """
     Find duplicate components in a dataset of bands/hashes.
@@ -1225,7 +1078,6 @@ def find_duplicate_components(
         max_iterations=max_cc_iterations,
         parallelism=hash_parallelism,
         num_gpus=num_gpus,
-        gpu_cc_impl=gpu_cc_impl,
     )
     logger.info("Length of components_ds: %s", components_ds.count())
     connected_components_end_time = time.time()
@@ -1358,17 +1210,6 @@ def main():
              "Set lower (e.g., 0.5) to improve GPU utilization through pipelining.",
     )
     parser.add_argument(
-        "--gpu-cc-impl",
-        choices=("auto", "current", "fused-blocks"),
-        default="auto",
-        help=(
-            "Connected-components implementation. 'auto' uses fused-blocks for "
-            "GPU runs and current for CPU runs. 'current' keeps the "
-            "GPUHashAggregate+join pipeline. 'fused-blocks' uses keyed GPU "
-            "shuffle plus block-local cuDF star reductions to reduce Step 6 stages."
-        ),
-    )
-    parser.add_argument(
         "--minhash-checkpoint-uri",
         type=str,
         help="Checkpoint URI for minhash bands",
@@ -1440,7 +1281,6 @@ def main():
             hash_parallelism=args.parallelism,
             num_gpus=args.num_gpus,
             edges_checkpoint_uri=args.edges_checkpoint_uri,
-            gpu_cc_impl=args.gpu_cc_impl,
         )
         duplicate_components = duplicate_components.materialize()
         if args.components_checkpoint_uri is not None:
