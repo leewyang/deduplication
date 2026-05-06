@@ -7,15 +7,15 @@ This implementation uses Ray Data's native operations (map_batches, aggregate, e
 to implement MinHash + LSH deduplication, similar to the Spark approach.
 
 This GPU-focused version is derived from ray_data_dedup_agg.py, but rewrites
-the hot aggregate stages to use built-in Count/Min AggregateFnV2 operations
-and keyed GPU-shuffle/cuDF reductions for connected components.
+the hot aggregate stages to use built-in Count AggregateFnV2 operations
+and keyed GPU-shuffle/cuDF emit/reduce stages.
 With DataContext.shuffle_strategy=GPU_SHUFFLE, those groupby().aggregate()
 calls are planned as GPUHashAggregateOperator instead of falling back to the
 CPU hash aggregate path for custom Python list aggregators.
 
 Architecture:
 1. MinHash signature generation (map_batches)
-2. LSH banding to generate candidate pairs (GPUHashAggregate Min/Count + join)
+2. LSH banding to generate candidate pairs (keyed GPU shuffle + block-local cuDF emit)
 3. Connected components (keyed GPU shuffle + block-local cuDF star reductions)
 """
 
@@ -33,7 +33,7 @@ import numpy as np
 import pyarrow as pa
 import pandas as pd
 import ray
-from ray.data.aggregate import AggregateFnV2, Count, Min
+from ray.data.aggregate import AggregateFnV2, Count
 from ray.data.block import Block, BlockAccessor
 from ray.data.context import DataContext, ShuffleStrategy
 from scipy import integrate
@@ -295,13 +295,45 @@ def gpu_fused_cc_partitions(parallelism: int) -> int:
     return min(gpu_hash_partitions(parallelism), 8)
 
 
-def project_collision_edges_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
-    """Project joined band rows into min-doc star edges on GPU."""
-    batch = batch[batch["band_group_size"] > 1]
+def empty_collision_edges_like(batch: cudf.DataFrame) -> cudf.DataFrame:
+    empty_doc_ids = batch["doc_id"].head(0)
     return cudf.DataFrame({
-        "src": batch["min_doc_id"],
-        "dst": batch["doc_id"],
+        "src": empty_doc_ids,
+        "dst": empty_doc_ids,
     })
+
+
+def emit_collision_edges_partition_gpu(batch: cudf.DataFrame) -> cudf.DataFrame:
+    """Emit min-doc star edges from one keyed GPU shuffle partition."""
+    key_columns = ["band_id", "band_hash"]
+    if len(batch) == 0:
+        return empty_collision_edges_like(batch)
+
+    unique_band_docs = batch[key_columns + ["doc_id"]].drop_duplicates()
+    if len(unique_band_docs) == 0:
+        return empty_collision_edges_like(batch)
+
+    band_stats = unique_band_docs.groupby(key_columns, as_index=False).agg(
+        min_doc_id=("doc_id", "min"),
+        band_group_size=("doc_id", "count"),
+    )
+    band_stats = band_stats[band_stats["band_group_size"] > 1]
+    if len(band_stats) == 0:
+        return empty_collision_edges_like(batch)
+
+    edges = unique_band_docs.merge(
+        band_stats[key_columns + ["min_doc_id"]],
+        on=key_columns,
+        how="inner",
+    )
+    edges = edges[edges["doc_id"] != edges["min_doc_id"]]
+    if len(edges) == 0:
+        return empty_collision_edges_like(batch)
+
+    return cudf.DataFrame({
+        "src": edges["min_doc_id"],
+        "dst": edges["doc_id"],
+    }).reset_index(drop=True)
 
 
 def empty_edge_batch_like(batch: cudf.DataFrame) -> cudf.DataFrame:
@@ -378,8 +410,8 @@ def map_gpu_blocks(
 ) -> ray.data.Dataset:
     """Map whole GPU shuffle output blocks.
 
-    Public map_batches requires an explicit batch_size with num_gpus, but grouped
-    star reductions need full key-partition blocks so keyed groups are not split.
+    Public map_batches requires an explicit batch_size with num_gpus, but keyed
+    GPU reducers/emitters need full partition blocks so groups are not split.
     """
     return ds._map_batches_without_batch_size_validation(
         fn,
@@ -422,45 +454,25 @@ def generate_edges_from_bands_gpu(
     bands_ds: ray.data.Dataset,
     hash_parallelism: int,
 ) -> ray.data.Dataset:
-    """Create LSH candidate edges using GPUHashAggregate Min()+Count()."""
+    """Create LSH candidate edges with one keyed GPU shuffle and block-local emit."""
     num_partitions = gpu_hash_partitions(hash_parallelism)
     key_columns = ["band_id", "band_hash"]
-    bands_ds = bands_ds.select_columns(key_columns + ["doc_id"])
+    logger.info("generate_edges_from_bands_gpu partitions: %s", num_partitions)
 
-    unique_bands_ds = (
-        bands_ds
-        .groupby(key_columns + ["doc_id"], num_partitions=num_partitions)
-        .aggregate(Count(alias_name="band_doc_count"))
-        .select_columns(key_columns + ["doc_id"])
-        .materialize()
+    selected = bands_ds.select_columns(key_columns + ["doc_id"])
+    shuffled = selected.repartition(
+        num_blocks=num_partitions,
+        keys=key_columns,
+        sort=True,
     )
 
-    band_stats = (
-        unique_bands_ds
-        .groupby(key_columns, num_partitions=num_partitions)
-        .aggregate(
-            Min(on="doc_id", alias_name="min_doc_id"),
-            Count(alias_name="band_group_size"),
-        )
-        .materialize()
+    start_time = time.time()
+    edges_ds = map_gpu_blocks(shuffled, emit_collision_edges_partition_gpu).materialize()
+    logger.info(
+        "generate_edges_from_bands_gpu keyed shuffle + emit time: %s seconds",
+        time.time() - start_time,
     )
-
-    return (
-        unique_bands_ds
-        .join(
-            band_stats,
-            join_type="inner",
-            num_partitions=num_partitions,
-            on=tuple(key_columns),
-        )
-        .map_batches(
-            project_collision_edges_gpu,
-            batch_format="cudf",
-            num_gpus=1,
-            batch_size=100_000,
-        )
-        .materialize()
-    )
+    return edges_ds
 
 
 def large_star_gpu_fused_blocks(
@@ -477,18 +489,17 @@ def large_star_gpu_fused_blocks(
             num_gpus=1,
             batch_size=100_000,
         )
-        .materialize()
     )
 
-    # Keep GPU stages out of a single streaming pipeline. GPUShuffle reserves
-    # gpu_shuffle_num_actors GPUs, so pipelining it with a 1-GPU map can request
-    # num_gpus + 1 GPUs and stall under Ray Data's resource budget.
+    # The physical optimizer can fuse the GPU map stages into the GPU shuffle
+    # rank actors, so this stays as one map-shuffle-map plan without requesting
+    # extra GPUs outside the shuffle pool.
     shuffled = emitted.repartition(
         num_blocks=num_partitions,
         keys=["node"],
         sort=True,
-    ).materialize()
-    return map_gpu_blocks(shuffled, local_large_star_reduce_gpu).materialize()
+    )
+    return map_gpu_blocks(shuffled, local_large_star_reduce_gpu)
 
 
 def small_star_gpu_fused_blocks(
@@ -505,15 +516,14 @@ def small_star_gpu_fused_blocks(
             num_gpus=1,
             batch_size=100_000,
         )
-        .materialize()
     )
 
     shuffled = emitted.repartition(
         num_blocks=num_partitions,
         keys=["node"],
         sort=True,
-    ).materialize()
-    return map_gpu_blocks(shuffled, local_small_star_reduce_gpu).materialize()
+    )
+    return map_gpu_blocks(shuffled, local_small_star_reduce_gpu)
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +849,10 @@ def compute_connected_components_distributed(
         current_ds = current_ds.materialize()
         # Step 1: Large-star
         if num_gpus > 0:
-            current_ds = large_star_gpu_fused_blocks(current_ds, parallelism)
+            current_ds = large_star_gpu_fused_blocks(
+                current_ds,
+                parallelism,
+            ).materialize()
             logger.info(
                 "Length of large_star_gpu_fused_blocks: %s",
                 current_ds.count(),
@@ -862,7 +875,10 @@ def compute_connected_components_distributed(
 
         # Step 2: Small-star
         if num_gpus > 0:
-            current_ds = small_star_gpu_fused_blocks(current_ds, parallelism)
+            current_ds = small_star_gpu_fused_blocks(
+                current_ds,
+                parallelism,
+            ).materialize()
             logger.info(
                 "Length of small_star_gpu_fused_blocks: %s",
                 current_ds.count(),
@@ -1031,10 +1047,11 @@ def find_duplicate_components(
     else:
         logger.info("Generating edges")
         logger.info("Number of blocks in bands_ds: %s", bands_ds.num_blocks())
-        logger.info("Step 3: Grouping by bands to find candidate pairs using aggregate...")
         if num_gpus > 0:
+            logger.info("Step 3: Grouping by bands using direct GPU partition emit path...")
             edges_ds = generate_edges_from_bands_gpu(bands_ds, hash_parallelism)
         else:
+            logger.info("Step 3: Grouping by bands to find candidate pairs using aggregate...")
             edges_ds = (
                 bands_ds
                 .groupby(['band_id', 'band_hash'], num_partitions=hash_parallelism)
@@ -1235,6 +1252,7 @@ def main():
         ctx.shuffle_strategy = ShuffleStrategy.GPU_SHUFFLE
         ctx.gpu_shuffle_num_actors = args.num_gpus
         ctx.gpu_join_left_chunk_rows = 100_000
+        ctx.set_config("gpu_shuffle_fuse_maps", True)
 
     # Read input data
     logger.info("Reading data from %s", args.input)
