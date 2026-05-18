@@ -279,7 +279,21 @@ def explode_star_pairs(row, agg_col):
 # ---------------------------------------------------------------------------
 
 def gpu_hash_partitions(parallelism: int) -> int:
-    return max(1, int(parallelism / 10))
+    """Override the default parallelism for GPU-based hash aggregations."""
+    if False:
+        # 10BT
+        return max(1, int(parallelism / 10))
+    else:
+        # 100BT
+        num_gpus = int(ray.cluster_resources().get("GPU", 0))
+        gpu_partitions = {
+            1: 1000,
+            2: 800,
+            4: 200,
+            8: 100,
+            16: 100,
+        }
+        return gpu_partitions.get(num_gpus, parallelism)
 
 
 def gpu_fused_cc_partitions(parallelism: int) -> int:
@@ -452,10 +466,9 @@ def gpu_distinct_2col(
 
 def generate_edges_from_bands_gpu(
     bands_ds: ray.data.Dataset,
-    hash_parallelism: int,
+    num_partitions: int,
 ) -> ray.data.Dataset:
     """Create LSH candidate edges with one keyed GPU shuffle and block-local emit."""
-    num_partitions = gpu_hash_partitions(hash_parallelism)
     key_columns = ["band_id", "band_hash"]
     logger.info("generate_edges_from_bands_gpu partitions: %s", num_partitions)
 
@@ -780,6 +793,85 @@ def cast_node_parent_large_string(batch: pa.Table) -> pa.Table:
     return batch.select(['node', 'parent']).cast(new_schema)
 
 
+def collect_column_as_set(
+    ds: ray.data.Dataset,
+    column: str,
+    batch_size: int = 1_000_000,
+) -> Set[Any]:
+    """Collect one dataset column into a Python set on the driver."""
+    values: Set[Any] = set()
+    rows_seen = 0
+    for batch in ds.select_columns([column]).iter_batches(
+        batch_format="pyarrow",
+        batch_size=batch_size,
+    ):
+        column_values = batch.column(column).to_pylist()
+        values.update(column_values)
+        rows_seen += len(column_values)
+        logger.info(
+            "Collected %s duplicate-key rows into %s unique keys",
+            rows_seen,
+            len(values),
+        )
+    return values
+
+
+class DuplicateKeyAntiFilter:
+    """Batch UDF that drops rows whose id column is in a broadcast key set."""
+
+    def __init__(self, duplicate_keys: Any, id_column: str):
+        if isinstance(duplicate_keys, ray.ObjectRef):
+            duplicate_keys = ray.get(duplicate_keys)
+        self._duplicate_keys = duplicate_keys
+        self._id_column = id_column
+        logger.info(
+            "Initialized duplicate-key anti-filter with %s keys",
+            len(self._duplicate_keys),
+        )
+
+    def __call__(self, batch: pa.Table) -> pa.Table:
+        ids = batch.column(self._id_column).to_pylist()
+        keep_mask = pa.array(
+            [doc_id not in self._duplicate_keys for doc_id in ids],
+            type=pa.bool_(),
+        )
+        return batch.filter(keep_mask)
+
+
+def anti_filter_without_shuffle(
+    ds: ray.data.Dataset,
+    duplicate_components: ray.data.Dataset,
+    id_column: str,
+    duplicate_key_column: str = "node",
+    batch_size: int = 100_000,
+    concurrency: int = 16,
+) -> ray.data.Dataset:
+    """Drop duplicate documents with a map-only anti-filter.
+
+    This avoids Ray Data hash join/shuffle in Step 8. The duplicate key set is
+    collected once, stored in the object store, and loaded by a bounded actor
+    pool so the full document rows are never repartitioned.
+    """
+    duplicate_key_set = collect_column_as_set(
+        duplicate_components.select_columns([duplicate_key_column]),
+        duplicate_key_column,
+    )
+    logger.info("Collected %s unique duplicate keys", len(duplicate_key_set))
+    duplicate_key_set_ref = ray.put(duplicate_key_set)
+    del duplicate_key_set
+
+    return ds.map_batches(
+        DuplicateKeyAntiFilter,
+        batch_format="pyarrow",
+        batch_size=batch_size,
+        zero_copy_batch=True,
+        fn_constructor_args=(duplicate_key_set_ref, id_column),
+        num_cpus=1,
+        concurrency=concurrency,
+        udf_modifying_row_count=True,
+    )
+
+
 def distinct_2col(
     current_ds: ray.data.Dataset,
     col_1,
@@ -1049,7 +1141,7 @@ def find_duplicate_components(
         logger.info("Number of blocks in bands_ds: %s", bands_ds.num_blocks())
         if num_gpus > 0:
             logger.info("Step 3: Grouping by bands using direct GPU partition emit path...")
-            edges_ds = generate_edges_from_bands_gpu(bands_ds, hash_parallelism)
+            edges_ds = generate_edges_from_bands_gpu(bands_ds, gpu_hash_partitions(hash_parallelism))
         else:
             logger.info("Step 3: Grouping by bands to find candidate pairs using aggregate...")
             edges_ds = (
@@ -1241,10 +1333,25 @@ def main():
         type=str,
         help="Checkpoint URI for deduplicated connected components",
     )
+    parser.add_argument(
+        "--filter-batch-size",
+        type=int,
+        default=100_000,
+        help="Batch size for Step 8 no-shuffle duplicate-key filtering",
+    )
+    parser.add_argument(
+        "--filter-concurrency",
+        type=int,
+        default=16,
+        help="Number of Step 8 no-shuffle filter actors",
+    )
 
     args = parser.parse_args()
 
     ray.init(num_gpus=args.num_gpus, _temp_dir=os.environ.get("RAY_TMP_DIR", "/tmp/ray"))
+    ctx = ray.data.context.DataContext.get_current()
+    # ctx.max_hash_shuffle_aggregators = 48
+
     if args.disable_progress_bars:
         ray.data.DataContext.get_current().enable_progress_bars = False
     if args.num_gpus > 0:
@@ -1253,6 +1360,9 @@ def main():
         ctx.gpu_shuffle_num_actors = args.num_gpus
         ctx.gpu_join_left_chunk_rows = 100_000
         ctx.set_config("gpu_shuffle_fuse_maps", True)
+        if args.num_gpus < 4:
+            # fewer GPUs require spill support
+            ctx.gpu_shuffle_rmm_pool_size = "auto"
 
     # Read input data
     logger.info("Reading data from %s", args.input)
@@ -1305,30 +1415,30 @@ def main():
             duplicate_components.write_parquet(args.components_checkpoint_uri)
     duplicate_count = duplicate_components.count()
 
-    # Join with original dataset to get full document content
-    logger.info("Step 8: Joining with original dataset...")
+    # Filter the original dataset without shuffling full document rows.
+    logger.info("Step 8: Filtering original dataset with duplicate keys...")
     join_start_time = time.time()
+
     if duplicate_count == 0:
-        # No duplicates found, skip the join
-        logger.info("No duplicates found, skipping join.")
+        # No duplicates found, skip the filter.
+        logger.info("No duplicates found, skipping filter.")
         deduplicated_ds = ds
     else:
-        if args.num_gpus > 0:
-            logger.info("Joining with original dataset using GPU...")
-            deduplicated_ds = ds.join(
-                duplicate_components,
-                on=(args.id_column,),
-                right_on=('node',),
-                join_type='left_anti',
-                num_partitions=gpu_hash_partitions(args.parallelism))
-        else:
-            logger.info("Joining with original dataset using CPU...")
-            deduplicated_ds = ds.join(
-                duplicate_components,
-                on=(args.id_column,),
-                right_on=('node',),
-                join_type='left_anti',
-                num_partitions=args.parallelism)
+        logger.info(
+            "Filtering original dataset without shuffle: duplicate_count=%s, "
+            "batch_size=%s, concurrency=%s",
+            duplicate_count,
+            args.filter_batch_size,
+            args.filter_concurrency,
+        )
+        deduplicated_ds = anti_filter_without_shuffle(
+            ds,
+            duplicate_components,
+            id_column=args.id_column,
+            duplicate_key_column="node",
+            batch_size=args.filter_batch_size,
+            concurrency=args.filter_concurrency,
+        )
     deduplicated_ds = deduplicated_ds.materialize()
     join_end_time = time.time()
     logger.info("Step 8 time: %s seconds", join_end_time - join_start_time)
